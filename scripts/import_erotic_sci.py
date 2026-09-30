@@ -430,10 +430,9 @@ def main() -> int:
                     help="管理员口令，默认读 HOME_AI_ADMIN_TOKEN")
     ap.add_argument("--price-micro-per-1k", type=int, default=1200,
                     help="每 1k token 的微元单价（1200 = 1.2 元/百万）")
-    ap.add_argument("--image-price-micro", type=int, default=2000,
+    ap.add_argument("--image-price-micro", type=int, default=100_000,
                     help="每张图的微元单价。**不能是 0**：网关对未配价的工作流"
-                         "直接拒绝出图。默认 2000 微元（0.002 元）只是占位，"
-                         "请按实际成本改。")
+                         "直接拒绝出图。默认 100000 微元 = 0.1 元/张。")
     ap.add_argument("--comfy-node-name", default="n1-comfy")
     ap.add_argument("--comfy-max-concurrency", type=int, default=2)
     ap.add_argument("--disable-nodes", nargs="*", default=["m2"],
@@ -477,9 +476,8 @@ def main() -> int:
 
     if any(n["lan_base_url"] for n in plan["nodes"]):
         rep.notes.append(
-            "内网地址（lan_base_url）只对出图端点生效。LLM 节点的这个字段会存下来、"
-            "在管理台显示，但请求走的是 base_url——「内网优先 + 探测不通回退公网」"
-            "还没实现，先当没这个字段。"
+            "内网地址走「内网优先 + 连不上自动回退公网」：内网不通只标记该节点的内网"
+            "地址不可用 2 分钟，**不会**把节点拖进冷却——同一台机器的公网地址可能好好的。"
         )
     if plan["workflows"] and args.image_price_micro <= 0:
         rep.notes.append(

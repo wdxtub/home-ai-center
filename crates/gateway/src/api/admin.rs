@@ -422,6 +422,14 @@ pub async fn list_nodes(State(s): Shared, _a: AdminAuthed) -> ApiResult<Json<Val
             "healthy": h.map(|x| x.healthy).unwrap_or(true),
             "cooldown_secs_remaining": h.map(|x| x.cooldown_secs_remaining).unwrap_or(0),
             "last_error": h.and_then(|x| x.last_error.clone()),
+            // 内网优先是否正在走公网兜底。不露出来的话这个回退是隐形的：
+            // 用户只会觉得「怎么变慢了」，不知道网关已经绕了一圈。
+            "lan_configured": n
+                .lan_base_url
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty()),
+            "lan_down": s.health.is_lan_down(n.id).await,
+            "lan_retry_after_secs": s.health.lan_down_remaining(n.id).await,
         }));
     }
     Ok(Json(json!({ "items": items })))
@@ -528,6 +536,9 @@ pub async fn update_node(
     if res.rows_affected() == 0 {
         return Err(ApiError::not_found("节点不存在"));
     }
+    // 改了配置就清掉内网不可达标记：标记按节点记，运营刚换上的新内网
+    // 地址会被上一条地址的旧标记压住，最长白等一个冷却周期。
+    s.health.mark_lan_up(id).await;
     s.reload().await?;
     Ok(Json(json!({ "ok": true })))
 }

@@ -33,6 +33,31 @@ impl LlmNode {
             .filter(|k| k.is_usable_at(now))
             .collect()
     }
+
+    /// 请求候选地址，**内网优先**。
+    ///
+    /// 家里的机器之间走局域网：外网要绕运营商再绕回来，家里宽带的上行
+    /// 通常远小于局域网，那一跳能把流式首字延迟拖到没法用。
+    ///
+    /// `lan_down` 为真时跳过内网——否则每次请求都要先付一次连接失败的钱。
+    /// 返回值按优先级排，调用方**只在连接级失败**时才试下一个；
+    /// 连上了但答错（限额、模型没加载、内容错误）说明地址是通的，
+    /// 换地址没有意义。
+    pub fn base_urls(&self, lan_down: bool) -> Vec<String> {
+        let lan = self
+            .lan_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let mut out = Vec::with_capacity(2);
+        if let Some(l) = lan.filter(|_| !lan_down) {
+            if l != self.base_url {
+                out.push(l.to_string());
+            }
+        }
+        out.push(self.base_url.clone());
+        out
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,5 +262,61 @@ mod tests {
             ],
         };
         assert!(node.enabled_keys(0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod base_url_tests {
+    use super::*;
+
+    fn node(base: &str, lan: Option<&str>) -> LlmNode {
+        LlmNode {
+            id: 1,
+            name: "n1".into(),
+            kind: "lmstudio".into(),
+            base_url: base.into(),
+            lan_base_url: lan.map(str::to_string),
+            max_concurrency: 2,
+            default_max_output_tokens: None,
+            enabled: true,
+            sort_order: 0,
+            extra_headers: Value::Null,
+            extra_body: Value::Null,
+            window: Default::default(),
+            keys: vec![],
+        }
+    }
+
+    /// 内网优先是这一整段存在的理由：顺序反了就等于没做。
+    #[test]
+    fn lan_comes_first() {
+        let n = node("http://pub:7001/v1", Some("http://192.168.50.197:1234/v1"));
+        assert_eq!(
+            n.base_urls(false),
+            vec!["http://192.168.50.197:1234/v1", "http://pub:7001/v1"]
+        );
+    }
+
+    /// 内网刚判不可达，这一段时间内不该每个请求都先撞一次墙。
+    #[test]
+    fn lan_down_skips_straight_to_public() {
+        let n = node("http://pub:7001/v1", Some("http://192.168.50.197:1234/v1"));
+        assert_eq!(n.base_urls(true), vec!["http://pub:7001/v1"]);
+    }
+
+    #[test]
+    fn no_lan_configured_is_just_the_public_url() {
+        let n = node("http://pub:7001/v1", None);
+        assert_eq!(n.base_urls(false), vec!["http://pub:7001/v1"]);
+        // 空串等同于没配
+        let n2 = node("http://pub:7001/v1", Some("   "));
+        assert_eq!(n2.base_urls(false), vec!["http://pub:7001/v1"]);
+    }
+
+    /// 两个地址填成一样时不能试两遍同一个地址。
+    #[test]
+    fn identical_lan_and_public_are_deduped() {
+        let n = node("http://same:1234/v1", Some("http://same:1234/v1"));
+        assert_eq!(n.base_urls(false), vec!["http://same:1234/v1"]);
     }
 }

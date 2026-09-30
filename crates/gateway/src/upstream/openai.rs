@@ -25,6 +25,12 @@ pub enum UpstreamError {
     Transient { retry_after_secs: Option<u64>, message: String },
     /// 节点故障：换点 + 冷却节点。
     Node { hard: bool, message: String },
+    /// **连都连不上**（DNS 失败 / 拒绝 / 超时）。
+    ///
+    /// 和 `Node` 分开是因为处置完全不同：连不上往往只针对**某一个地址**
+    /// （比如家里换了网络、内网那台关机了），换个地址同一个节点可能完全正常。
+    /// 「内网优先 + 回退公网」就靠这个变体驱动。
+    Transport { message: String, timeout: bool },
     /// LM Studio「模型加载中」，原地等，不算故障。
     ModelLoading,
     /// 请求体问题（内容错误），原样抛给客户端。
@@ -36,17 +42,39 @@ const MODEL_LOADING_MARKER: &str = "no models loaded";
 
 pub struct OpenAiClient {
     http: reqwest::Client,
+    /// 连接超时很短的同款客户端，只给「还有兜底地址」的那次尝试用。
+    ///
+    /// 内网那台机器关机时，内核往往不是立刻 refuse，而是把 SYN 丢在黑洞里，
+    /// TCP connect 要挂到系统级超时（macOS 上是 75 秒）。回退写得再对，
+    /// 每次先白等 75 秒也等于没做。
+    http_quick: reqwest::Client,
 }
+
+/// 「先试内网、失败就换公网」时给内网那次尝试的连接超时。
+const FALLBACK_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl OpenAiClient {
     pub fn new(timeout_secs: u64) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            // 出图 / 内网直连不读系统代理：macOS 的 Clash 之类会把内网请求
-            // 带回 502，让「内网优先」永远失效。
-            .no_proxy()
-            .build()?;
-        Ok(Self { http })
+        let build = || {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(timeout_secs))
+                // 出图 / 内网直连不读系统代理：macOS 的 Clash 之类会把内网请求
+                // 带回 502，让「内网优先」永远失效。
+                .no_proxy()
+        };
+        Ok(Self {
+            http: build().build()?,
+            http_quick: build().connect_timeout(FALLBACK_CONNECT_TIMEOUT).build()?,
+        })
+    }
+
+    /// `quick` = 这次失败后面还有地址可试，所以只给连接阶段很短的时间。
+    fn client(&self, quick: bool) -> &reqwest::Client {
+        if quick {
+            &self.http_quick
+        } else {
+            &self.http
+        }
     }
 
     fn endpoint(base_url: &str) -> String {
@@ -60,9 +88,10 @@ impl OpenAiClient {
         api_key: &str,
         body: &Value,
         extra_headers: &Value,
+        quick: bool,
     ) -> Result<Value, UpstreamError> {
         let mut req = self
-            .http
+            .client(quick)
             .post(Self::endpoint(base_url))
             .bearer_auth(api_key)
             .json(body);
@@ -73,8 +102,8 @@ impl OpenAiClient {
                 }
             }
         }
-        let resp = req.send().await.map_err(|e| UpstreamError::Node {
-            hard: !matches!(e, reqwest::Error { .. } if e.is_timeout()),
+        let resp = req.send().await.map_err(|e| UpstreamError::Transport {
+            timeout: e.is_timeout(),
             message: e.to_string(),
         })?;
 
@@ -85,7 +114,24 @@ impl OpenAiClient {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
         let text = resp.text().await.unwrap_or_default();
-        let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let json: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            // 2xx 但 body 不是 JSON：SSE 发到了非流式请求上、代理插了一段
+            // HTML、编码坏了……都归到这里。**不能**退化成 Null，否则下游会
+            // 安静地解析出「一个空补全」，客户端拿到空回答，账目还照记。
+            Err(e) => {
+                if (200..300).contains(&status) {
+                    return Err(UpstreamError::Node {
+                        hard: false,
+                        message: format!(
+                            "上游返回 {status} 但响应体不是 JSON（{e}）：{}",
+                            text.chars().take(120).collect::<String>()
+                        ),
+                    });
+                }
+                Value::Null
+            }
+        };
 
         if (200..300).contains(&status) {
             if let Some(msg) = error_envelope(&json) {
@@ -103,9 +149,10 @@ impl OpenAiClient {
         api_key: &str,
         body: &Value,
         extra_headers: &Value,
+        quick: bool,
     ) -> Result<reqwest::Response, UpstreamError> {
         let mut req = self
-            .http
+            .client(quick)
             .post(Self::endpoint(base_url))
             .bearer_auth(api_key)
             .json(body);
@@ -116,8 +163,8 @@ impl OpenAiClient {
                 }
             }
         }
-        let resp = req.send().await.map_err(|e| UpstreamError::Node {
-            hard: !e.is_timeout(),
+        let resp = req.send().await.map_err(|e| UpstreamError::Transport {
+            timeout: e.is_timeout(),
             message: e.to_string(),
         })?;
 
@@ -152,6 +199,20 @@ impl OpenAiClient {
                     if let Some(msg) = error_envelope(&json) {
                         return Err(envelope_error(msg));
                     }
+                }
+                // 连 SSE 的样子都没有：要么上游没实现流式，要么路径错了。
+                // 当流读会一路读到 EOF，客户端只看到「正常结束的空回答」——
+                // 和 2xx 错误信封是同一类静默失败，一样要报出来。
+                //
+                // 反过来，有些服务端流式内容对但忘了写 Content-Type，
+                // 那种按内容放行，不能一刀切。
+                if !looks_like_sse(&bytes) {
+                    return Err(UpstreamError::Node {
+                        hard: false,
+                        message: "上游没有返回 SSE 流（Content-Type 不是 \
+                                  text/event-stream，内容也不是 SSE 帧）"
+                            .into(),
+                    });
                 }
                 let mut rebuilt = http::Response::builder().status(status).version(version);
                 if let Some(h) = rebuilt.headers_mut() {
@@ -195,8 +256,17 @@ fn error_envelope(json: &Value) -> Option<String> {
     Some(msg)
 }
 
-fn envelope_error(msg: String) -> UpstreamError {
-    // 软失败：不冷却节点、不轮换 key——上游是通的，只是这次没给结果。
+/// 内容本身是不是 SSE 帧。给「忘了写 Content-Type 但确实是流」的后端兜底。
+fn looks_like_sse(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(512)];
+    let text = String::from_utf8_lossy(head);
+    text.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("data:") || t.starts_with("event:") || t.starts_with(":")
+    })
+}
+
+fn envelope_error(msg: String) -> UpstreamError {    // 软失败：不冷却节点、不轮换 key——上游是通的，只是这次没给结果。
     // 但必须**响亮地**报出去，而不是伪装成一次空补全。
     UpstreamError::Node {
         hard: false,
@@ -353,6 +423,7 @@ pub async fn probe(
     api_key: &str,
     model: &str,
     extra_body: &Value,
+    quick: bool,
 ) -> Result<(), String> {
     let mut body = serde_json::json!({
         "model": model,
@@ -364,7 +435,7 @@ pub async fn probe(
             obj.insert(k.clone(), v.clone());
         }
     }
-    match client.post_chat(base_url, api_key, &body, &Value::Null).await {
+    match client.post_chat(base_url, api_key, &body, &Value::Null, quick).await {
         Ok(_) => Ok(()),
         Err(UpstreamError::ModelLoading) => Ok(()), // 加载中也算活着
         Err(UpstreamError::Quota(_)) => Err("quota".into()),
@@ -504,5 +575,28 @@ mod tests {
         )
         .unwrap();
         assert!(error_envelope(&json).is_none());
+    }
+}
+
+#[cfg(test)]
+mod sse_shape_tests {
+    use super::looks_like_sse;
+
+    #[test]
+    fn sse_frames_are_recognized_even_without_the_content_type() {
+        assert!(looks_like_sse(b"data: {\"choices\":[]}\n\ndata: [DONE]\n\n"));
+        assert!(looks_like_sse(b"event: message_start\ndata: {}\n\n"));
+        // 注释行（心跳）也算
+        assert!(looks_like_sse(b": ping\n\ndata: {}\n\n"));
+    }
+
+    /// 非流式的 Chat 响应绝不能被当成 SSE 放行，否则会读出一个空流。
+    #[test]
+    fn a_plain_chat_completion_is_not_sse() {
+        assert!(!looks_like_sse(
+            br#"{"id":"x","choices":[{"message":{"content":"hi"}}]}"#
+        ));
+        assert!(!looks_like_sse(b""));
+        assert!(!looks_like_sse(b"<html>404</html>"));
     }
 }

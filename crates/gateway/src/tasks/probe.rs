@@ -51,15 +51,36 @@ pub async fn probe_all(s: &Arc<AppState>) {
             continue;
         };
 
-        match openai::probe(
-            &client,
-            &node.base_url,
-            &key.secret,
-            &model,
-            &node.extra_body,
-        )
-        .await
-        {
+        // 和真实请求同一套地址优先级（内网优先）。探针走公网而请求走内网，
+        // 就会出现「探针说活着、请求连不上」的假象。
+        let urls = node.base_urls(s.health.is_lan_down(node.id).await);
+        let mut outcome: Result<(), String> = Err("没有可用地址".into());
+        for (i, url) in urls.iter().enumerate() {
+            outcome = openai::probe(
+                &client,
+                url,
+                &key.secret,
+                &model,
+                &node.extra_body,
+                i + 1 < urls.len(),
+            )
+            .await
+            .map_err(|e| e.to_string());
+            if outcome.is_ok() {
+                if i > 0 {
+                    s.health.mark_lan_up(node.id).await;
+                }
+                break;
+            }
+            let transport = matches!(&outcome, Err(m) if is_transport(m));
+            if transport && i + 1 < urls.len() {
+                s.health.mark_lan_down(node.id, url).await;
+                continue;
+            }
+            break;
+        }
+
+        match outcome {
             Ok(()) => {
                 s.health.mark_success(node.id).await;
             }
@@ -73,6 +94,19 @@ pub async fn probe_all(s: &Arc<AppState>) {
             }
         }
     }
+}
+
+/// 探针错误文案里带这些词，就认为是「连不上」而不是「连上了但答错」。
+fn is_transport(msg: &str) -> bool {
+    const MARKERS: [&str; 5] = [
+        "error sending request",
+        "connection refused",
+        "timed out",
+        "timeout",
+        "dns error",
+    ];
+    let lower = msg.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
 }
 
 pub async fn scheduler(s: Arc<AppState>) {
@@ -103,13 +137,23 @@ pub async fn probe_comfy(s: &Arc<AppState>) {
 
 /// 把一次上游失败归到节点健康表。供请求路径复用。
 pub async fn note_failure(s: &Arc<AppState>, node_id: i64, e: &UpstreamError) {
-    if let UpstreamError::Node { hard, message } = e {
-        s.health
-            .mark_failure(
-                node_id,
-                if *hard { FailureKind::Hard } else { FailureKind::Soft },
-                message,
-            )
-            .await;
-    }
+    let (kind, msg) = match e {
+        UpstreamError::Node { hard, message } => (
+            if *hard { FailureKind::Hard } else { FailureKind::Soft },
+            message.as_str(),
+        ),
+        UpstreamError::Transport { message, timeout } => (
+            if *timeout { FailureKind::Soft } else { FailureKind::Hard },
+            message.as_str(),
+        ),
+        // 限额是 key 的问题、模型加载中节点是活的、瞬时错误原地重试就有：
+        // 都不该动节点冷却
+        UpstreamError::Quota(_)
+        | UpstreamError::ModelLoading
+        | UpstreamError::Client(_)
+        | UpstreamError::Transient { .. } => {
+            return;
+        }
+    };
+    s.health.mark_failure(node_id, kind, msg).await;
 }

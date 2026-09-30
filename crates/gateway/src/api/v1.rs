@@ -362,11 +362,45 @@ async fn run_admission(
         }
 
         // ⑥ 执行。流式在这里只拿到响应头，token 数要等流读完。
-        let upstream_resp = if req.stream {
-            exec_stream(&http, &pick, &body).await.map(ExecResult::Stream)
-        } else {
-            exec_once(&http, &pick, &body).await
+        //
+        // 内网优先：候选地址是「内网 → 公网」。**只有连接级失败**才换下一个
+        // 地址——连上了但限额 / 模型没加载 / 内容有问题，说明这个地址是通的，
+        // 换地址只会把同一个错误再犯一遍，还白等一个超时。
+        let urls = pick
+            .node
+            .base_urls(sched.health.is_lan_down(pick.node.id).await);
+        let mut addr = 0usize;
+        let upstream_resp = loop {
+            // 后面还有地址可试 → 只给连接阶段 2 秒，别在内网黑洞上白等
+            let quick = addr + 1 < urls.len();
+            let r = if req.stream {
+                exec_stream(&http, &pick, &body, &urls[addr], quick)
+                    .await
+                    .map(ExecResult::Stream)
+            } else {
+                exec_once(&http, &pick, &body, &urls[addr], quick).await
+            };
+            match r {
+                Err(UpstreamError::Transport { message, .. }) if addr + 1 < urls.len() => {
+                    tracing::warn!(
+                        node = %pick.node.name,
+                        url = %urls[addr],
+                        error = %message,
+                        "内网地址不可达，同一节点改走公网"
+                    );
+                    sched.health.mark_lan_down(pick.node.id, &urls[addr]).await;
+                    addr += 1;
+                }
+                other => break other,
+            }
         };
+        // 只有**内网自己打通**才清标记。
+        // 候选数 >1 才说明内网这次真的参与了尝试；候选数 ==1 时
+        // addr==0 意味着内网被标记跳过了、这次走的是公网，清掉标记
+        // 就等于每个请求都重新去撞一次不通的内网。
+        if urls.len() > 1 && addr == 0 && upstream_resp.is_ok() {
+            sched.health.mark_lan_up(pick.node.id).await;
+        }
 
         let ctx = LogCtx {
             request_id: request_id.to_string(),
@@ -485,6 +519,25 @@ async fn run_admission(
                 drop(pick.lease);
                 continue;
             }
+            // 走到这里说明**所有候选地址都连不上**（内网已经回退过公网了），
+            // 节点是真的不可达。
+            Err(UpstreamError::Transport { message, timeout }) => {
+                sched
+                    .health
+                    .mark_failure(
+                        pick.node.id,
+                        if timeout { FailureKind::Soft } else { FailureKind::Hard },
+                        &message,
+                    )
+                    .await;
+                last_err = Some(ApiError::upstream(format!(
+                    "节点 {} 的所有地址都连不上：{message}",
+                    pick.node.name
+                )));
+                tried_nodes.push(pick.node.id);
+                drop(pick.lease);
+                continue;
+            }
             Err(UpstreamError::Client(m)) => {
                 drop(pick.lease);
                 return Err(ApiError::bad_request(m));
@@ -515,14 +568,11 @@ async fn exec_once(
     http: &openai::OpenAiClient,
     pick: &NodePick,
     body: &Value,
+    base_url: &str,
+    quick: bool,
 ) -> Result<ExecResult, UpstreamError> {
     let raw = http
-        .post_chat(
-            &pick.node.base_url,
-            &pick.key.secret,
-            body,
-            &pick.node.extra_headers,
-        )
+        .post_chat(base_url, &pick.key.secret, body, &pick.node.extra_headers, quick)
         .await?;
     Ok(ExecResult::Once(upstream_chat::parse_response(&raw)))
 }
@@ -531,14 +581,11 @@ async fn exec_stream(
     http: &openai::OpenAiClient,
     pick: &NodePick,
     body: &Value,
+    base_url: &str,
+    quick: bool,
 ) -> Result<reqwest::Response, UpstreamError> {
-    http.post_chat_stream(
-        &pick.node.base_url,
-        &pick.key.secret,
-        body,
-        &pick.node.extra_headers,
-    )
-    .await
+    http.post_chat_stream(base_url, &pick.key.secret, body, &pick.node.extra_headers, quick)
+        .await
 }
 
 // ── 流式渲染 ────────────────────────────────────────────────────────────────

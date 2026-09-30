@@ -61,9 +61,58 @@ impl Default for NodeState {
 #[derive(Default)]
 pub struct NodeHealth {
     states: Mutex<HashMap<i64, NodeState>>,
+    /// 内网地址「连不上」的截止时刻。
+    ///
+    /// 和 `NodeState.retry_after` 分开：内网不通**不代表节点坏了**
+    /// （同一台机器的公网地址可能好好的），所以不能进节点冷却，
+    /// 否则一次换网络就能把所有节点拖进冷却里。
+    lan_until: Mutex<HashMap<i64, std::time::Instant>>,
 }
 
+/// 内网不可达后多久再试一次内网。取中间值：短了反复付连接失败的钱，
+/// 长了家里内网恢复后要干等。
+const LAN_RETRY_AFTER: Duration = Duration::from_secs(120);
+
 impl NodeHealth {
+    /// 这个节点的内网地址现在是不是不可用。
+    pub async fn is_lan_down(&self, node_id: i64) -> bool {
+        let mut m = self.lan_until.lock().await;
+        match m.get(&node_id) {
+            Some(t) if std::time::Instant::now() < *t => true,
+            Some(_) => {
+                m.remove(&node_id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    pub async fn mark_lan_down(&self, node_id: i64, url: &str) {
+        self.lan_until
+            .lock()
+            .await
+            .insert(node_id, std::time::Instant::now() + LAN_RETRY_AFTER);
+        tracing::warn!(
+            node = node_id,
+            url = %url,
+            retry_after_secs = LAN_RETRY_AFTER.as_secs(),
+            "内网地址连不上，先走公网"
+        );
+    }
+
+    /// 内网真的通了才清标记。用公网成功**不能**清，否则每个请求
+    /// 都会重新去撞一次不通的内网。
+    pub async fn mark_lan_up(&self, node_id: i64) {
+        self.lan_until.lock().await.remove(&node_id);
+    }
+
+    pub async fn lan_down_remaining(&self, node_id: i64) -> i64 {
+        let m = self.lan_until.lock().await;
+        m.get(&node_id)
+            .map(|t| (t.saturating_duration_since(std::time::Instant::now())).as_secs() as i64)
+            .unwrap_or(0)
+    }
+
     pub async fn mark_failure(&self, node_id: i64, kind: FailureKind, error: &str) {
         let mut m = self.states.lock().await;
         let st = m.entry(node_id).or_default();
@@ -339,4 +388,40 @@ pub struct HealthRow {
     pub cooldown_secs_remaining: i64,
     pub last_error: Option<String>,
     pub last_success_at: Option<i64>,
+}
+
+#[cfg(test)]
+mod lan_tests {
+    use super::*;
+
+    /// 内网不通**不能**进节点冷却：同一台机器的公网地址可能好好的，
+    /// 进冷却等于一次换网络就把所有节点拖下线。
+    #[tokio::test]
+    async fn lan_down_does_not_cool_the_node() {
+        let h = NodeHealth::default();
+        assert!(!h.is_lan_down(1).await);
+        h.mark_lan_down(1, "http://192.168.50.197:1234/v1").await;
+        assert!(h.is_lan_down(1).await);
+        // 节点本身仍然是健康的、没进冷却
+        assert!(!h.is_cooling(1).await);
+        let st = h.snapshot().await;
+        assert!(!st.contains_key(&1), "内网标记不该新建节点健康记录");
+    }
+
+    #[tokio::test]
+    async fn lan_up_clears_the_mark() {
+        let h = NodeHealth::default();
+        h.mark_lan_down(1, "http://lan/v1").await;
+        h.mark_lan_up(1).await;
+        assert!(!h.is_lan_down(1).await);
+    }
+
+    /// 标记是按节点分的，不能互相污染。
+    #[tokio::test]
+    async fn lan_state_is_per_node() {
+        let h = NodeHealth::default();
+        h.mark_lan_down(1, "http://lan1/v1").await;
+        assert!(h.is_lan_down(1).await);
+        assert!(!h.is_lan_down(2).await);
+    }
 }

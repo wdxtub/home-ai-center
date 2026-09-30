@@ -139,6 +139,9 @@ export interface LlmNode {
   healthy: boolean
   cooldown_secs_remaining: number
   last_error: string | null
+  lan_configured: boolean
+  lan_down: boolean
+  lan_retry_after_secs: number
 }
 
 export interface ComfyNode {

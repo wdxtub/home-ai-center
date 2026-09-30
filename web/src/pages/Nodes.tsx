@@ -163,7 +163,7 @@ export default function Nodes() {
             },
             {
               title: '状态',
-              width: 150,
+              width: 190,
               render: (_, n) => (
                 <Space direction="vertical" size={2}>
                   {!n.enabled && <Tag>已停用</Tag>}
@@ -176,6 +176,14 @@ export default function Nodes() {
                       </Tag>
                     </Tooltip>
                   )}
+                  {n.lan_configured &&
+                    (n.lan_down ? (
+                      <Tooltip title={`内网 ${n.lan_base_url ?? ''} 连不上，正在走公网`}>
+                        <Tag color="orange">走公网 {cooldown(n.lan_retry_after_secs)}</Tag>
+                      </Tooltip>
+                    ) : (
+                      <Tag color="cyan">内网优先</Tag>
+                    ))}
                 </Space>
               ),
             },
