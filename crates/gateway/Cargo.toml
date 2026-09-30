@@ -1,0 +1,54 @@
+[package]
+name = "home-ai-center"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "家庭内部 AI 网关：按节点并发度调度的 LLM 与 ComfyUI 聚合网关"
+
+[[bin]]
+name = "home-ai-center"
+path = "src/main.rs"
+
+[lib]
+name = "hac"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+sqlx.workspace = true
+time.workspace = true
+chrono.workspace = true
+arc-swap = "1"
+chrono-tz.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+argon2.workspace = true
+rand.workspace = true
+include_dir.workspace = true
+percent-encoding.workspace = true
+base64.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

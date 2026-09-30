@@ -1,0 +1,384 @@
+//! 上游 OpenAI Chat Completions 客户端。
+//!
+//! 节点只讲这一种方言。这里的职责：
+//! - 组装请求（含节点级 `extra_body` / `extra_headers`）；
+//! - **强制注入 `stream_options.include_usage`**，否则拿不到 token 数；
+//! - 把错误分类成「限额类（换 key）」「瞬时类（原地等）」「节点故障（换点）」；
+//! - 把 SSE chunk 流式转成 `UnifiedEvent`。
+//!
+//! 出错时不重建 client：节点 URL 固定，client 可以一直复用。
+
+use futures::StreamExt;
+use serde_json::Value;
+
+use crate::keys::classify::{self, Failure, QuotaClass, QuotaVerdict};
+use crate::protocol::ir::UnifiedEvent;
+use crate::protocol::upstream_chat;
+
+/// 上游失败。三类处置完全不同，不能混为一谈。
+#[derive(Debug)]
+pub enum UpstreamError {
+    /// 限额类：换一把 key 重试，**不判节点离线**。
+    Quota(QuotaVerdict),
+    /// 瞬时类：原地退避，**不换 key**。
+    Transient { retry_after_secs: Option<u64>, message: String },
+    /// 节点故障：换点 + 冷却节点。
+    Node { hard: bool, message: String },
+    /// LM Studio「模型加载中」，原地等，不算故障。
+    ModelLoading,
+    /// 请求体问题（内容错误），原样抛给客户端。
+    Client(String),
+}
+
+/// 命中「模型加载中」的判据。节点是活的，只是模型还没加载完。
+const MODEL_LOADING_MARKER: &str = "no models loaded";
+
+pub struct OpenAiClient {
+    http: reqwest::Client,
+}
+
+impl OpenAiClient {
+    pub fn new(timeout_secs: u64) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            // 出图 / 内网直连不读系统代理：macOS 的 Clash 之类会把内网请求
+            // 带回 502，让「内网优先」永远失效。
+            .no_proxy()
+            .build()?;
+        Ok(Self { http })
+    }
+
+    fn endpoint(base_url: &str) -> String {
+        format!("{}/chat/completions", base_url.trim_end_matches('/'))
+    }
+
+    /// 发一次非流式请求。
+    pub async fn post_chat(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        body: &Value,
+        extra_headers: &Value,
+    ) -> Result<Value, UpstreamError> {
+        let mut req = self
+            .http
+            .post(Self::endpoint(base_url))
+            .bearer_auth(api_key)
+            .json(body);
+        if let Some(map) = extra_headers.as_object() {
+            for (k, v) in map {
+                if let Some(s) = v.as_str() {
+                    req = req.header(k, s);
+                }
+            }
+        }
+        let resp = req.send().await.map_err(|e| UpstreamError::Node {
+            hard: !matches!(e, reqwest::Error { .. } if e.is_timeout()),
+            message: e.to_string(),
+        })?;
+
+        let status = resp.status().as_u16();
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let text = resp.text().await.unwrap_or_default();
+        let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+
+        if (200..300).contains(&status) {
+            return Ok(json);
+        }
+        Err(classify_failure(status, retry_after, &json, &text))
+    }
+
+    /// 发一次流式请求，返回 SSE 字节流。
+    pub async fn post_chat_stream(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        body: &Value,
+        extra_headers: &Value,
+    ) -> Result<reqwest::Response, UpstreamError> {
+        let mut req = self
+            .http
+            .post(Self::endpoint(base_url))
+            .bearer_auth(api_key)
+            .json(body);
+        if let Some(map) = extra_headers.as_object() {
+            for (k, v) in map {
+                if let Some(s) = v.as_str() {
+                    req = req.header(k, s);
+                }
+            }
+        }
+        let resp = req.send().await.map_err(|e| UpstreamError::Node {
+            hard: !e.is_timeout(),
+            message: e.to_string(),
+        })?;
+
+        let status = resp.status().as_u16();
+        if (200..300).contains(&status) {
+            return Ok(resp);
+        }
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let text = resp.text().await.unwrap_or_default();
+        let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Err(classify_failure(status, retry_after, &json, &text))
+    }
+}
+
+/// 把一次 HTTP 失败分派到三条处置路径之一。
+pub fn classify_failure(
+    status: u16,
+    retry_after: Option<String>,
+    json: &Value,
+    raw_text: &str,
+) -> UpstreamError {
+    let lower = raw_text.to_ascii_lowercase();
+
+    // LM Studio 的 JIT 加载：节点是活的，不该判离线
+    if status == 400 && lower.contains(MODEL_LOADING_MARKER) {
+        return UpstreamError::ModelLoading;
+    }
+
+    let header_fn = |k: &str| {
+        if k.eq_ignore_ascii_case("retry-after") {
+            retry_after.clone()
+        } else {
+            None
+        }
+    };
+    let verdict = classify::classify(&Failure {
+        status,
+        headers: &header_fn,
+        body: json,
+    });
+
+    match verdict.class {
+        QuotaClass::LongQuota | QuotaClass::KeyDead => UpstreamError::Quota(verdict),
+        QuotaClass::Transient => {
+            // 5xx 属于节点故障（换点 + 冷却），不是「原地等」
+            if status >= 500 || status == 429 && verdict.rule == "R12_upstream_5xx" {
+                return UpstreamError::Node {
+                    hard: status >= 500,
+                    message: classify::error_message(json),
+                };
+            }
+            if status == 401 || status == 403 || status == 402 {
+                return UpstreamError::Node {
+                    hard: false,
+                    message: classify::error_message(json),
+                };
+            }
+            UpstreamError::Transient {
+                retry_after_secs: verdict
+                    .reset_at
+                    .map(|t| (t - crate::keys::unix_now()).max(0) as u64),
+                message: classify::error_message(json),
+            }
+        }
+    }
+}
+
+/// 把上游 SSE 字节流解析成 `UnifiedEvent`。
+///
+/// 末块陷阱：开 `include_usage` 后只有最后一个 chunk 带真实 usage，
+/// 且它的 `choices` 是**空数组**——朴素实现写 `chunk.choices[0]` 会崩。
+pub fn parse_sse_stream(body: reqwest::Response) -> impl futures::Stream<Item = UnifiedEvent> {
+    let stream = body.bytes_stream().map(|r| r.ok()).map(Option::unwrap_or_default);
+    futures::stream::unfold(
+        SseReader {
+            body: Box::pin(stream),
+            buf: String::new(),
+            eof: false,
+        },
+        |mut st| async move {
+            loop {
+                // SSE 以空行分隔事件；攒够一个就吐出去
+                while let Some(pos) = find_event_end(&st.buf) {
+                    let raw: String = st.buf.drain(..pos).collect();
+                    if let Some(ev) = parse_one_event(&raw) {
+                        return Some((ev, st));
+                    }
+                }
+                if st.eof {
+                    // 最后一帧常常没有收尾空行，必须把缓冲区里剩下的也解析掉，
+                    // 否则整条回复会丢掉最后一个 token。
+                    let rest = std::mem::take(&mut st.buf);
+                    return parse_one_event(&rest).map(|ev| (ev, st));
+                }
+                match st.body.next().await {
+                    Some(bytes) => st.buf.push_str(&String::from_utf8_lossy(&bytes)),
+                    None => st.eof = true,
+                }
+            }
+        },
+    )
+}
+
+struct SseReader {
+    body: std::pin::Pin<Box<dyn futures::Stream<Item = bytes::Bytes> + Send>>,
+    buf: String,
+    eof: bool,
+}
+
+fn find_event_end(buf: &str) -> Option<usize> {
+    // 空行可能是 \n\n 或 \r\n\r\n
+    if let Some(i) = buf.find("\n\n") {
+        return Some(i + 2);
+    }
+    if let Some(i) = buf.find("\r\n\r\n") {
+        return Some(i + 4);
+    }
+    None
+}
+
+fn parse_one_event(raw: &str) -> Option<UnifiedEvent> {
+    let data: Vec<&str> = raw
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect();
+    if data.is_empty() {
+        return None;
+    }
+    let payload = data.join("\n");
+    if upstream_chat::is_done_sentinel(&payload) {
+        return Some(UnifiedEvent::Done {
+            usage: Default::default(),
+            finish_reason: Some(crate::protocol::ir::FinishReason::Stop),
+        });
+    }
+    let v: Value = serde_json::from_str(&payload).ok()?;
+    upstream_chat::parse_chunk(&v).into_iter().next()
+}
+
+/// 健康探测：发一个最小 chat 请求。成功即代表推理链路真正可用。
+///
+/// 不用 `GET /models`：它无法触发模型加载，「恢复」可能只是服务在跑而
+/// 模型未加载，真实请求仍会超时。
+pub async fn probe(
+    client: &OpenAiClient,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    extra_body: &Value,
+) -> Result<(), String> {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{"role":"user","content":"ping"}],
+        "max_completion_tokens": 1,
+    });
+    if let (Some(b), Some(obj)) = (extra_body.as_object(), body.as_object_mut()) {
+        for (k, v) in b {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    match client.post_chat(base_url, api_key, &body, &Value::Null).await {
+        Ok(_) => Ok(()),
+        Err(UpstreamError::ModelLoading) => Ok(()), // 加载中也算活着
+        Err(UpstreamError::Quota(_)) => Err("quota".into()),
+        Err(e) => Err(format!("{e:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn model_loading_is_not_a_node_fault() {
+        let e = classify_failure(
+            400,
+            None,
+            &json!({"error":{"message":"No models loaded. Try loading them first."}}),
+            "No models loaded",
+        );
+        assert!(matches!(e, UpstreamError::ModelLoading));
+    }
+
+    #[test]
+    fn long_quota_error_becomes_quota_path() {
+        let e = classify_failure(
+            429,
+            None,
+            &json!({"error":{"message":"You have reached your specified API usage limits."}}),
+            "",
+        );
+        assert!(matches!(e, UpstreamError::Quota(_)));
+    }
+
+    #[test]
+    fn transient_429_with_retry_after_waits() {
+        let e = classify_failure(
+            429,
+            Some("20".into()),
+            &json!({"error":{"type":"rate_limit_error","message":"x"}}),
+            "",
+        );
+        match e {
+            UpstreamError::Transient { retry_after_secs, .. } => {
+                assert!(retry_after_secs.unwrap() <= 61);
+            }
+            other => panic!("expected Transient, got {other:?}"),
+        }
+    }
+
+    /// 防 litellm 反模式：5xx 是节点故障（换点），不是换 key。
+    #[test]
+    fn upstream_5xx_is_node_fault_not_quota() {
+        let e = classify_failure(503, None, &json!({"error":{"message":"overloaded"}}), "");
+        assert!(matches!(e, UpstreamError::Node { .. }));
+    }
+
+    #[test]
+    fn sse_event_split_handles_chunked_arrival() {
+        let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let ev = parse_one_event(raw).unwrap();
+        assert_eq!(
+            ev,
+            UnifiedEvent::TextDelta { text: "hi".into() }
+        );
+    }
+
+    #[test]
+    fn sse_done_sentinel_becomes_done_event() {
+        let ev = parse_one_event("data: [DONE]\n\n").unwrap();
+        assert!(matches!(ev, UnifiedEvent::Done { .. }));
+    }
+
+    /// 回归：上游最后一帧常常不带收尾空行，朴素实现会把它整段丢掉，
+    /// 表现为「回复少最后几个字」或「Anthropic 一直等 message_stop」。
+    #[test]
+    fn trailing_event_without_blank_line_is_not_lost() {
+        let mut st = SseReader {
+            body: Box::pin(futures::stream::empty()),
+            buf: "data: {\"choices\":[{\"delta\":{\"content\":\"tail\"}}]}\n\ndata: [DONE]".into(),
+            eof: true,
+        };
+        // 先吃掉完整事件，缓冲区只剩没有收尾空行的最后一段
+        let pos = find_event_end(&st.buf).unwrap();
+        let raw: String = st.buf.drain(..pos).collect();
+        assert!(matches!(
+            parse_one_event(&raw),
+            Some(UnifiedEvent::TextDelta { .. })
+        ));
+        let rest = std::mem::take(&mut st.buf);
+        assert!(matches!(
+            parse_one_event(&rest),
+            Some(UnifiedEvent::Done { .. })
+        ));
+    }
+
+    #[test]
+    fn sse_multiline_data_is_joined() {
+        let ev = parse_one_event("data: {\"choices\":\ndata: [{\"delta\":{\"content\":\"x\"}}]}\n\n").unwrap();
+        assert!(matches!(ev, UnifiedEvent::TextDelta { .. }));
+    }
+}
