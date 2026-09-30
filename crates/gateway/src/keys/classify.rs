@@ -270,10 +270,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn no_headers(_: &str) -> Option<String> {
-        None
-    }
-
     fn hdr(v: Option<&str>) -> impl Fn(&str) -> Option<String> + '_ {
         move |k: &str| {
             if k.eq_ignore_ascii_case("retry-after") {

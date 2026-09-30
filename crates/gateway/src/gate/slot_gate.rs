@@ -73,8 +73,6 @@ struct Waiter {
     /// 被授予名额时先置位，再唤醒。等待 future 若在此之前被取消，
     /// 靠这个标志判断是否需要归还。
     granted: Arc<AtomicBool>,
-    /// 等待 future 正常结束（拿到名额或超时）后置位，避免 Drop 重复处理。
-    finished: Arc<AtomicBool>,
 }
 
 /// 闸门共享状态。`SlotGate` 与 `SlotLease` 都持有它，保证归还打到同一份计数。
@@ -162,7 +160,7 @@ impl SlotGate {
         let limit = limit.max(1);
         let started = std::time::Instant::now();
 
-        let (seq, notify, granted, finished) = {
+        let (seq, notify, granted) = {
             let mut st = self.inner.state.lock().await;
             // 有空位且**无人排队**才直接放行，否则会插到先到的等待者前面。
             if st.active < limit && Inner::total_waiting(&st) == 0 {
@@ -181,14 +179,12 @@ impl SlotGate {
             let seq = st.seq;
             let notify = Arc::new(Notify::new());
             let granted = Arc::new(AtomicBool::new(false));
-            let finished = Arc::new(AtomicBool::new(false));
             st.queues[priority.queue_index()].push_back(Waiter {
                 seq,
                 notify: notify.clone(),
                 granted: granted.clone(),
-                finished: finished.clone(),
             });
-            (seq, notify, granted, finished)
+            (seq, notify, granted)
         };
 
         // 等待段由 `WaitGuard` 承载。它是**栈上的 RAII 守卫**，
@@ -199,7 +195,8 @@ impl SlotGate {
             limit,
             seq,
             granted: granted.clone(),
-            finished: finished.clone(),
+            // 守卫自己的标志：不入队，只用于区分「正常走完」与「被取消」
+            finished: Arc::new(AtomicBool::new(false)),
             timeout,
             started,
             handled: false,

@@ -160,7 +160,7 @@ pub fn parse_go_duration(raw: &str) -> Option<i64> {
         let unit: String = bytes[ustart..i].iter().collect();
         let mult = match unit.as_str() {
             "ns" => 1e-9,
-            "us" | "\u{b5}s" | "µs" => 1e-6,
+            "µs" | "\u{3bc}s" => 1e-6,
             "ms" => 1e-3,
             "s" => 1.0,
             "m" => 60.0,

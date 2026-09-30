@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod images;
 pub mod v1;
 
 use std::sync::Arc;

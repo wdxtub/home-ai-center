@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use sqlx::{Row, SqlitePool};
 
+use crate::domain::comfy::ComfyNode;
 use crate::domain::node::{LlmNode, LlmRoute, NodeKey, NodeKeyState, RateLimitScope};
 use crate::domain::pricing::{ModelPrice, PriceTable};
 use crate::domain::window::DisabledWindow;
@@ -111,6 +112,33 @@ pub async fn load_snapshot(pool: &SqlitePool) -> anyhow::Result<Snapshot> {
             count_false_positive: r.get("count_false_positive"),
             last_used_at: r.get("last_used_at"),
             soft_cap_reached,
+        });
+    }
+
+    // ── ComfyUI 端点 ──
+    for r in sqlx::query(
+        "SELECT id, name, base_url, lan_base_url, username, password, max_concurrency,
+                enabled, sort_order, disabled_start, disabled_end, disabled_timezone
+         FROM comfy_node ORDER BY sort_order, id",
+    )
+    .fetch_all(pool)
+    .await?
+    {
+        snap.comfy_nodes.push(ComfyNode {
+            id: r.get("id"),
+            name: r.get("name"),
+            base_url: r.get("base_url"),
+            lan_base_url: r.get("lan_base_url"),
+            username: r.get("username"),
+            password: r.get("password"),
+            max_concurrency: r.get("max_concurrency"),
+            enabled: r.get::<i64, _>("enabled") != 0,
+            sort_order: r.get("sort_order"),
+            window: DisabledWindow::new(
+                r.get::<Option<i64>, _>("disabled_start").map(|v| v as u8),
+                r.get::<Option<i64>, _>("disabled_end").map(|v| v as u8),
+                r.get("disabled_timezone"),
+            ),
         });
     }
 

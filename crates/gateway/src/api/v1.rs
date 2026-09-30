@@ -418,7 +418,6 @@ async fn run_admission(
                     reservation,
                     ctx,
                     usage: UnifiedUsage::default(),
-                    saw_done: false,
                     est_input,
                     out_chars: 0,
                     price: *price,
@@ -608,7 +607,6 @@ struct StreamTail {
     reservation: Arc<Reservation>,
     ctx: LogCtx,
     usage: UnifiedUsage,
-    saw_done: bool,
     est_input: u32,
     out_chars: usize,
     price: ModelPrice,
@@ -778,6 +776,7 @@ impl FramePump {
         self.pending.pop_front()
     }
 
+    #[cfg(test)]
     fn exhausted(&self) -> bool {
         self.pending.is_empty() && self.upstream_done
     }
