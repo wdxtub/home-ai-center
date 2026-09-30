@@ -88,6 +88,9 @@ impl OpenAiClient {
         let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
 
         if (200..300).contains(&status) {
+            if let Some(msg) = error_envelope(&json) {
+                return Err(envelope_error(msg));
+            }
             return Ok(json);
         }
         Err(classify_failure(status, retry_after, &json, &text))
@@ -120,6 +123,48 @@ impl OpenAiClient {
 
         let status = resp.status().as_u16();
         if (200..300).contains(&status) {
+            // 2xx 不保证是 SSE。路径写错时 LM Studio 同样回 200，
+            // body 却是 JSON 错误信封——直接当流读会一路读到 EOF，
+            // 客户端只看到「正常结束的空回答」。
+            //
+            // 非 SSE 时把 body 缓冲下来再重建 Response：既能把错误信封
+            // 挑出来报错，也不会把 body 吃掉。
+            let looks_sse = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.contains("text/event-stream"));
+            if !looks_sse {
+                // 缓冲下来重建一个 Response：既能把错误信封挑出来报错，
+                // 也不会把 body 吃掉。流式路径只用 `bytes_stream()`，
+                // 因此丢 URL/扩展没有影响。
+                let (status, version, headers) = (resp.status(), resp.version(), resp.headers().clone());
+                let bytes = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Err(UpstreamError::Node {
+                            hard: false,
+                            message: format!("读取上游响应体失败：{e}"),
+                        })
+                    }
+                };
+                if let Ok(json) = serde_json::from_slice::<Value>(&bytes) {
+                    if let Some(msg) = error_envelope(&json) {
+                        return Err(envelope_error(msg));
+                    }
+                }
+                let mut rebuilt = http::Response::builder().status(status).version(version);
+                if let Some(h) = rebuilt.headers_mut() {
+                    *h = headers;
+                }
+                return match rebuilt.body(bytes) {
+                    Ok(r) => Ok(reqwest::Response::from(r)),
+                    Err(e) => Err(UpstreamError::Node {
+                        hard: false,
+                        message: format!("重建上游响应失败：{e}"),
+                    }),
+                };
+            }
             return Ok(resp);
         }
         let retry_after = resp
@@ -130,6 +175,35 @@ impl OpenAiClient {
         let text = resp.text().await.unwrap_or_default();
         let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         Err(classify_failure(status, retry_after, &json, &text))
+    }
+}
+
+/// 挑出「2xx 里裹着的错误信封」。
+///
+/// OpenAI 兼容服务端有个很坑的习惯：**路径写错也回 200**，body 却是
+/// `{"error": "Unexpected endpoint or method. (POST /chat/completions)"}`
+/// （LM Studio 原样如此）。不挑出来的话，`parse_response` 会把它当成
+/// 「一个没有 choices 的正常补全」，客户端收到空回答，网关还照常按
+/// 估算 token 计费——配置错了却什么都看不出来。
+fn error_envelope(json: &Value) -> Option<String> {
+    let e = json.get("error")?;
+    let msg = match e {
+        Value::String(s) if !s.trim().is_empty() => s.trim().to_string(),
+        Value::Object(_) => classify::error_message(json),
+        _ => return None,
+    };
+    Some(msg)
+}
+
+fn envelope_error(msg: String) -> UpstreamError {
+    // 软失败：不冷却节点、不轮换 key——上游是通的，只是这次没给结果。
+    // 但必须**响亮地**报出去，而不是伪装成一次空补全。
+    UpstreamError::Node {
+        hard: false,
+        message: format!(
+            "上游返回 2xx 但响应体是错误：{msg}。\
+             若 base_url 只填到了端口，请补上 /v1 —— 网关会在其后拼 /chat/completions。"
+        ),
     }
 }
 
@@ -390,5 +464,45 @@ mod tests {
     fn sse_multiline_data_is_joined() {
         let ev = parse_one_event("data: {\"choices\":\ndata: [{\"delta\":{\"content\":\"x\"}}]}\n\n").unwrap();
         assert!(matches!(ev, UnifiedEvent::TextDelta { .. }));
+    }
+
+    /// LM Studio 对错误路径回的是 200 + 错误信封，不是 404。
+    /// 这条判据一旦失效，空补全就会被当成正常结果照常计费。
+    #[test]
+    fn two_hundred_with_error_envelope_is_not_a_completion() {
+        let json: Value = serde_json::from_str(
+            r#"{"error":"Unexpected endpoint or method. (POST /chat/completions)"}"#,
+        )
+        .unwrap();
+        let msg = error_envelope(&json).expect("必须认出错误信封");
+        assert!(msg.contains("Unexpected endpoint"));
+
+        match envelope_error(msg) {
+            UpstreamError::Node { hard, message } => {
+                // 软失败：上游是通的，只是这次没给结果，不该冷却节点
+                assert!(!hard, "错误信封不该把节点判死");
+                assert!(message.contains("/v1"), "错误信息要提示 base_url 该怎么填：{message}");
+            }
+            other => panic!("实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normal_completion_has_no_error_envelope() {
+        let json: Value = serde_json::from_str(
+            r#"{"id":"x","model":"m","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        )
+        .unwrap();
+        assert!(error_envelope(&json).is_none(), "正常补全不能被误判");
+    }
+
+    /// 嵌套的 `error` 字段（工具调用里的）不能被当成信封。
+    #[test]
+    fn nested_error_field_is_not_an_envelope() {
+        let json: Value = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":"ok"}}],"error":null}"#,
+        )
+        .unwrap();
+        assert!(error_envelope(&json).is_none());
     }
 }

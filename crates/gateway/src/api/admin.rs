@@ -601,7 +601,12 @@ fn mask(secret: &str) -> String {
 
 #[derive(Deserialize)]
 pub struct KeyBody {
-    pub secret: String,
+    /// 建 key 时必填；更新时留空表示不改明文。
+    ///
+    /// 这里**不能**是必填的 `String`：管理台的编辑弹窗不展示明文，
+    /// 提交上来的 body 里没有这个字段，serde 会直接 422，
+    /// 结果就是「改个标签都存不进去」。
+    pub secret: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
     pub sort_order: Option<i64>,
@@ -619,7 +624,7 @@ pub async fn create_key(
     Path(node_id): Path<i64>,
     Json(b): Json<KeyBody>,
 ) -> ApiResult<Response> {
-    let secret = b.secret.trim();
+    let secret = b.secret.as_deref().unwrap_or_default().trim();
     if secret.len() < 8 {
         return Err(ApiError::bad_request("API Key 太短"));
     }
@@ -652,9 +657,11 @@ pub async fn update_key(
     Path(id): Path<i64>,
     Json(b): Json<KeyBody>,
 ) -> ApiResult<Json<Value>> {
+    // 空串 = 不改明文。这样「只改标签」和「顺手换 key」都能走同一个入口。
     let res = sqlx::query(
         "UPDATE llm_node_key SET label=COALESCE(?, label), sort_order=COALESCE(?, sort_order),
                 enabled=COALESCE(?, enabled), rate_limit_scope=COALESCE(?, rate_limit_scope),
+                secret=COALESCE(NULLIF(TRIM(?), ''), secret),
                 soft_cap_window_ms=?, soft_cap_tokens=?, updated_at=?
          WHERE id = ?",
     )
@@ -662,6 +669,7 @@ pub async fn update_key(
     .bind(b.sort_order)
     .bind(b.enabled.map(|v| v as i64))
     .bind(b.rate_limit_scope.as_deref().map(RateLimitScope::parse).map(RateLimitScope::as_str))
+    .bind(b.secret.as_deref().map(str::trim))
     .bind(b.soft_cap_window_ms)
     .bind(b.soft_cap_tokens)
     .bind(now())
@@ -1469,4 +1477,30 @@ pub async fn backup_retention(State(s): Shared, _a: AdminAuthed) -> ApiResult<Js
 /// 读路径本来就容忍非法 JSON（回退空对象），所以这里给 "{}" 即可。
 fn json_str(v: &Option<Value>) -> String {
     v.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "{}".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 管理台的编辑弹窗不展示明文，提交上来的 body 里没有 `secret`。
+    /// 这个 body 必须能反序列化，否则「改个标签」永远 422。
+    #[test]
+    fn key_body_accepts_an_edit_without_the_secret() {
+        let b: KeyBody = serde_json::from_value(json!({
+            "label": "备用",
+            "sort_order": 1,
+            "enabled": false
+        }))
+        .expect("编辑 key 的请求体不该要求 secret");
+        assert_eq!(b.secret, None);
+        assert_eq!(b.label.as_deref(), Some("备用"));
+    }
+
+    #[test]
+    fn key_body_still_carries_the_secret_on_create() {
+        let b: KeyBody = serde_json::from_value(json!({"secret": "sk-abcdefgh"}))
+            .expect("建 key 必须能带上明文");
+        assert_eq!(b.secret.as_deref(), Some("sk-abcdefgh"));
+    }
 }

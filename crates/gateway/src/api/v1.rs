@@ -353,6 +353,13 @@ async fn run_admission(
                 obj.insert(k.clone(), v.clone());
             }
         }
+        // 对外模型名 → 上游模型名。放在 extra_body 之后：路由是最终裁决者。
+        // 不做这一步的话，同一个模型在不同节点上用不同别名（灰度、区分
+        // 量化版本）时会一直把对外名发过去，上游要么报「没有这个模型」，
+        // 要么——像 LM Studio 那样——回一个空补全。
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("model".into(), Value::String(pick.upstream_model.clone()));
+        }
 
         // ⑥ 执行。流式在这里只拿到响应头，token 数要等流读完。
         let upstream_resp = if req.stream {

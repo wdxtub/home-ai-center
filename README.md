@@ -32,10 +32,22 @@ docker compose up -d
 
 ### 1. LLM 节点
 
-填名称、上游地址（**只填到端口**，网关自己补 `/chat/completions`）、最大并发。
+填名称、上游地址、最大并发。
+
+> **上游地址要填到「端点前缀」，和 OpenAI SDK 的 `base_url` 一个意思**：
+> 网关只在其后拼 `/chat/completions`。所以 LM Studio 填 `http://n1-lms.wdxmzy.com:7001/v1`，
+> **带 `/v1`**；只填到端口会变成 `POST /chat/completions`。
+>
+> 这个坑不好察觉：LM Studio 对错误路径回的是 **200 + `{"error":"Unexpected endpoint..."}`**，
+> 不是 404。网关会把它认出来并报 502（见「上游 2xx 里裹着错误信封」），但第一次配的时候
+> 还是照着填全。
 
 > 上游必须是 OpenAI Chat Completions 方言。LM Studio / Ollama / OMLX / vLLM 都满足。
 > 部分后端不支持 `/v1/responses`，所以网关统一走上游 Chat，再渲染成客户端要的协议。
+
+**「内网地址」目前只对出图端点生效。** LLM 节点的 `lan_base_url` 会存下来、在管理台显示，
+但请求路径读的是 `base_url`——「内网优先、探测不通回退公网」这套逻辑还没实现（ComfyUI 那边
+已经走 `effective_base_url()`）。先当没这个字段。
 
 **「每日禁用时段」**用于「白天不用、晚上才开机」这类场景，跨午夜直接填 `23 → 7`。
 起止相同会被拒绝（那等于永久禁用，请用启用开关）。
@@ -66,15 +78,44 @@ docker compose up -d
 把**对外模型名**映射到「节点 + 上游模型名」。同一个模型可以挂多个节点，
 调度按**并发占用率最低**选——所以「1 台 1 并发 + 1 台 4 并发」时不会把慢机器一直塞满。
 
+「上游模型名」和对外名可以不同（对外叫 `fast`、上游叫 `qwen3.8-27b`）。
+调度选中哪条路由，就按那条路由的上游名发请求。多数情况下两边填一样就行。
+
 ### 4. 设置 → 定价
 
 按模型配「输入 / 输出 / 缓存输入」的单价，单位**微元 / 1k token**（1 元 = 1,000,000 微元）。
 缓存命中按 `cached_input` 单价计，不配就按普通输入价。
 
+> 1.2 元 / 百万 token = **1200 微元 / 1k**，输入输出同价就这么填。
+
 ### 5. 账号
 
 给每个使用者建一个账号，设余额和并发额度。**明文 key 只在创建时显示一次**，
 库里只存 SHA-256 哈希。
+
+### 6. 从 erotic_sci 一次性导入
+
+仓库里带了个导入脚本，把已有的 LM Studio / ComfyUI 配置搬过来：
+
+```bash
+# 用一个装了 pyyaml 的解释器（erotic_sci 自带的 .venv 就行）
+/path/to/erotic_sci/.venv/bin/python scripts/import_erotic_sci.py \
+  --password "$HOME_AI_ADMIN_TOKEN"
+
+# 只看要写什么，不落库
+... --dry-run
+```
+
+它会读 `config/ingest.yaml`、`.env`、`config/comfyui/*.json`，建好
+**节点 + key + 路由 + 定价 + ComfyUI 端点 + 工作流 + 一个自用账号**。
+
+- **脚本里没有任何明文密钥**，全部运行时从源仓库读，可以安全提交
+- **幂等**：按名字 upsert，可以反复跑；已存在的 key 不会覆盖
+- 工作流的参数槽是**从模板里扫出来的**，不手写，所以模板改了不会对不上
+- 含 `image` 槽的工作流（img2img）导入后**停用**——网关只做「提交 + 轮询取图」，
+  没有 `/upload/image`，那个槽要的是 ComfyUI 机器上已经存在的文件名
+- 出图单价默认 2000 微元（占位），用 `--image-price-micro` 改
+  （**不能填 0**：网关对未配价的工作流直接拒绝出图）
 
 ---
 
@@ -256,6 +297,12 @@ crates/gateway/src/
 - **冷却状态落库**是「运行时态只在内存」的唯一例外。
 - **绝不轮换 5xx / 529 / `slow_down`**：它们是上游容量信号，不是限额信号。
   （litellm 正是在此踩坑：按状态码一律 5 秒冷却。）
+- **2xx 不代表成功。** OpenAI 兼容服务端有个坑习惯：路径写错也回 200，body 却是
+  `{"error":"..."}`（LM Studio 原样如此）。`upstream_chat::parse_response` 遇到没有
+  `choices` 的 body 会安静地解析出「一个空补全」，于是客户端收到空回答、网关照常按
+  估算 token 计费。`openai::error_envelope` 就是拦这个的，别删。
+- **`upstream_model` 必须在请求路径上生效**。调度器选中哪条路由，就按那条路由的
+  上游名发 `model` 字段；只按对外名发的话，别名 / 灰度全是摆设。
 
 改完 SQL 后跑一遍审计：
 

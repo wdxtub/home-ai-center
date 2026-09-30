@@ -129,6 +129,9 @@ pub struct NodePick {
     pub key: NodeKey,
     pub lease: crate::gate::SlotLease,
     pub queue_wait_ms: i64,
+    /// 实际发给上游的模型名。**可能与客户端请求的模型名不同**——
+    /// 调度器已经知道选中了哪条路由，就该由它把映射结果一起带出来。
+    pub upstream_model: String,
 }
 
 /// 选点时的比较键。**按占用率排，不是按绝对并发**——
@@ -233,11 +236,13 @@ impl NodeScheduler {
                     if let Some(key) = self.keys.pick(n).await {
                         let key_id = key.id;
                         self.keys.mark_used(key_id).await;
+                        let upstream_model = snap.upstream_model(model, node_id);
                         return Ok(NodePick {
                             node: n.clone(),
                             key,
                             lease,
                             queue_wait_ms: started.elapsed().as_millis() as i64,
+                            upstream_model,
                         });
                     }
                 }
@@ -278,11 +283,13 @@ impl NodeScheduler {
                             if let Some(key) = self.keys.pick(n).await {
                                 let key_id = key.id;
                                 self.keys.mark_used(key_id).await;
+                                let upstream_model = snap.upstream_model(model, fid);
                                 return Ok(NodePick {
                                     node: n.clone(),
                                     key,
                                     lease,
                                     queue_wait_ms: started.elapsed().as_millis() as i64,
+                                    upstream_model,
                                 });
                             }
                             continue;

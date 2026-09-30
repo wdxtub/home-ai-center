@@ -772,6 +772,7 @@ dependencies = [
  "chrono-tz",
  "futures",
  "futures-util",
+ "http",
  "http-body-util",
  "hyper",
  "include_dir",

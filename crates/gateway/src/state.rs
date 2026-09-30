@@ -61,6 +61,22 @@ impl Snapshot {
         self.model_routes.get(model).cloned().unwrap_or_default()
     }
 
+    /// 某个 (对外模型名, 节点) 实际要发给上游的模型名。
+    ///
+    /// 路由表里 `model_name` 与 `upstream_model` 分开存就是为了让对外名
+    /// 和上游名解耦（同一个模型在不同节点上别名不同、灰度换模型名）。
+    /// 找不到就退回对外名——那正是绝大多数情况下的正确答案。
+    ///
+    /// 返回 `String` 而不是 `&str`：兜底分支要返回**传进来**的那个名字，
+    /// 它的生命周期比 `self` 短，硬借用会把两个生命周期绑在一起。
+    pub fn upstream_model(&self, model: &str, node_id: i64) -> String {
+        self.routes
+            .iter()
+            .find(|r| r.model_name == model && r.node_id == node_id)
+            .map(|r| r.upstream_model.clone())
+            .unwrap_or_else(|| model.to_string())
+    }
+
     /// 全部对外暴露的工作流名（出图侧相当于「模型列表」）。
     pub fn workflow_names(&self) -> Vec<String> {
         self.workflows
@@ -206,3 +222,40 @@ pub fn window_of(n: &LlmNode) -> DisabledWindow {
 }
 
 pub type SharedAccount = Account;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route(model: &str, node: i64, upstream: &str) -> LlmRoute {
+        LlmRoute {
+            id: node,
+            model_name: model.into(),
+            node_id: node,
+            upstream_model: upstream.into(),
+            enabled: true,
+            priority: 0,
+        }
+    }
+
+    /// 对外名与上游名解耦是这个方法存在的全部理由：
+    /// 同一模型在 A 节点叫 `qwen3.5-4b-heretic`、在 B 节点叫 `mlx-4b` 时，
+    /// 必须各发各的。发错的话上游要么报「没这个模型」，要么回空补全。
+    #[test]
+    fn upstream_model_follows_the_picked_route() {
+        let mut s = Snapshot::default();
+        s.routes.push(route("qwen3.5-4b-heretic", 1, "heretic-gguf"));
+        s.routes.push(route("qwen3.5-4b-heretic", 2, "heretic-mlx"));
+        assert_eq!(s.upstream_model("qwen3.5-4b-heretic", 1), "heretic-gguf");
+        assert_eq!(s.upstream_model("qwen3.5-4b-heretic", 2), "heretic-mlx");
+    }
+
+    /// 绝大多数情况两边同名，取不到路由时退回对外名才是对的。
+    #[test]
+    fn unknown_route_falls_back_to_the_requested_name() {
+        let mut s = Snapshot::default();
+        s.routes.push(route("a", 1, "a-upstream"));
+        assert_eq!(s.upstream_model("a", 99), "a");
+        assert_eq!(s.upstream_model("never-configured", 1), "never-configured");
+    }
+}

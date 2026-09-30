@@ -19,6 +19,9 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
 hyper = "1"
 http-body-util = "0.1"
+# reqwest 不重导出 `http` 本体，但重建一个 Response 需要它。
+# 已经在依赖树里（reqwest 依赖它），显式列出来不引入新的编译单元。
+http = "1"
 bytes = "1"
 futures = "0.3"
 futures-util = "0.3"
