@@ -75,6 +75,15 @@ pub enum RateLimitScope {
 }
 
 impl RateLimitScope {
+    /// 词表必须与 migration 里 `CHECK (rate_limit_scope IN (...))` 一致。
+    /// 写库路径一律走这里，不要在 handler 里手写字面量。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RateLimitScope::PerKey => "perKey",
+            RateLimitScope::Account => "account",
+        }
+    }
+
     pub fn parse(s: &str) -> Self {
         if s.eq_ignore_ascii_case("account") {
             RateLimitScope::Account

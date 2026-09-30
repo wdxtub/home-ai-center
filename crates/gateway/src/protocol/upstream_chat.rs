@@ -264,11 +264,185 @@ pub fn parse_usage(usage: Option<&Value>) -> UnifiedUsage {
     }
 }
 
+/// 流式 chunk 解析器。
+///
+/// ## 为什么必须有状态
+///
+/// 开 `stream_options.include_usage` 后，OpenAI 的收尾顺序是：
+///
+/// ```text
+/// ... 内容块 ...
+/// data: {... "choices":[{"delta":{},"finish_reason":"stop"}]}   ← 先给 finish_reason
+/// data: {... "choices":[], "usage":{...}}                       ← **后**给 usage
+/// data: [DONE]
+/// ```
+///
+/// 也就是说 **`finish_reason` 比 `usage` 先到**。如果在 finish_reason 块上
+/// 就发 `Done`，渲染器会把流标记为已结束，后面那个真正带 token 数的块
+/// 会被直接丢弃——结果是**每一次流式请求都按估算计费**，
+/// 而上游其实给了准确数字。
+///
+/// 所以这里把 `finish_reason` 记下来，等到 usage 块（或 `[DONE]` 哨兵）
+/// 才真正发 `Done`。
+#[derive(Debug, Default)]
+pub struct ChunkState {
+    pending_finish: Option<FinishReason>,
+    usage: UnifiedUsage,
+    /// 已经发过 `Done`，之后的块一律不再产出终止事件。
+    finished: bool,
+    /// 是否真的见过带 usage 的块（用来区分「上游没给」与「上游给了 0」）。
+    got_usage: bool,
+}
+
+impl ChunkState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn feed(&mut self, raw: &Value) -> Vec<UnifiedEvent> {
+        if self.finished {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+
+        if let Some(err) = raw.get("error") {
+            self.finished = true;
+            out.push(UnifiedEvent::Error {
+                message: err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("上游流式错误")
+                    .to_string(),
+                code: err.get("code").and_then(Value::as_str).map(str::to_string),
+            });
+            return out;
+        }
+
+        let usage = parse_usage(raw.get("usage"));
+        let has_usage = usage != UnifiedUsage::default();
+        if has_usage {
+            self.usage = usage;
+            self.got_usage = true;
+        }
+
+        let first = raw
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first());
+
+        match first {
+            Some(choice) => {
+                out.extend(parse_choice_delta(choice));
+                if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+                    self.pending_finish = Some(FinishReason::from_upstream(fr));
+                }
+                // 有的后端把 finish_reason 和 usage 放在同一块里
+                if self.pending_finish.is_some() && self.got_usage {
+                    self.finished = true;
+                    out.push(UnifiedEvent::Done {
+                        usage: self.usage,
+                        finish_reason: self.pending_finish,
+                    });
+                }
+            }
+            None => {
+                // 末块：choices 为空，只带 usage
+                if self.got_usage {
+                    self.finished = true;
+                    out.push(UnifiedEvent::Done {
+                        usage: self.usage,
+                        finish_reason: self.pending_finish,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// 解析一个原始 SSE 事件（`data:` 行已合并）。
+    /// 返回 `None` 表示这一段没有可产出的事件：心跳、注释行，
+    /// 或者流已收尾后到达的多余块。
+    pub fn feed_raw(&mut self, raw: &str) -> Option<Vec<UnifiedEvent>> {
+        let data: Vec<&str> = raw
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect();
+        if data.is_empty() {
+            return None;
+        }
+        let payload = data.join("\n");
+        if is_done_sentinel(&payload) {
+            let evs = self.finish();
+            return if evs.is_empty() { None } else { Some(evs) };
+        }
+        let v: Value = serde_json::from_str(&payload).ok()?;
+        let evs = self.feed(&v);
+        if evs.is_empty() {
+            None
+        } else {
+            Some(evs)
+        }
+    }
+
+    /// `[DONE]` 哨兵或流结束。补一个 `Done` 让渲染器收尾——
+    /// 三个协议都靠终止事件收尾，漏掉会让 Anthropic SDK 永久挂起。
+    pub fn finish(&mut self) -> Vec<UnifiedEvent> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        vec![UnifiedEvent::Done {
+            usage: self.usage,
+            finish_reason: self.pending_finish,
+        }]
+    }
+}
+
+fn parse_choice_delta(choice: &Value) -> Vec<UnifiedEvent> {
+    let mut out = Vec::new();
+    let Some(d) = choice.get("delta") else {
+        return out;
+    };
+    if let Some(t) = d.get("reasoning_content").and_then(Value::as_str) {
+        if !t.is_empty() {
+            out.push(UnifiedEvent::ReasoningDelta { text: t.to_string() });
+        }
+    }
+    if let Some(t) = d.get("content").and_then(Value::as_str) {
+        if !t.is_empty() {
+            out.push(UnifiedEvent::TextDelta { text: t.to_string() });
+        }
+    }
+    for tc in d.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+        let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let f = tc.get("function");
+        let name = f.and_then(|f| f.get("name")).and_then(Value::as_str);
+        let id = f.and_then(|f| f.get("id")).and_then(Value::as_str);
+        let call_id = tc.get("id").and_then(Value::as_str);
+        if name.is_some() || call_id.is_some() {
+            out.push(UnifiedEvent::ToolCallStart {
+                index,
+                id: call_id.or(id).unwrap_or("").to_string(),
+                name: name.unwrap_or("").to_string(),
+            });
+        }
+        if let Some(args) = f.and_then(|f| f.get("arguments")).and_then(Value::as_str) {
+            if !args.is_empty() {
+                out.push(UnifiedEvent::ToolCallArgsDelta {
+                    index,
+                    fragment: args.to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// 把一个上游 `chat.completion.chunk` 归一成若干 `UnifiedEvent`。
 ///
-/// **末块陷阱**：开 `stream_options.include_usage` 后，只有最后一个 chunk 带
-/// 真实 `usage`，且它的 `choices` 是**空数组**——朴素实现若写
-/// `chunk.choices[0]` 会在这里崩掉。
+/// 无状态版本，适合单块解析。**流式路径请用 [`ChunkState`]**——
+/// 理由见它的文档注释（finish_reason 早于 usage 到达）。
 pub fn parse_chunk(raw: &Value) -> Vec<UnifiedEvent> {
     let mut out = Vec::new();
 
@@ -349,6 +523,85 @@ pub fn is_done_sentinel(data: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    /// 承重回归：OpenAI 在 `include_usage` 下的收尾顺序是
+    /// **先 finish_reason、后 usage**。如果在 finish_reason 块就发 Done，
+    /// 后面那个真正带 token 数的块会被丢弃——结果就是**每一次流式请求
+    /// 都按估算计费**，而上游其实给了准确数字。
+    #[test]
+    fn usage_chunk_after_finish_reason_is_not_lost() {
+        let mut st = ChunkState::new();
+        let mut done: Option<UnifiedEvent> = None;
+
+        for c in [
+            json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+            json!({"choices":[], "usage":{"prompt_tokens":100,"completion_tokens":20}}),
+        ] {
+            for ev in st.feed(&c) {
+                if let UnifiedEvent::Done { usage, .. } = ev {
+                    done = Some(UnifiedEvent::Done {
+                        usage,
+                        finish_reason: Some(FinishReason::Stop),
+                    });
+                }
+            }
+        }
+        let UnifiedEvent::Done { usage, .. } = done.expect("必须收到 Done") else {
+            panic!("收到的事件类型不对")
+        };
+        assert_eq!(usage.input_tokens, 100, "usage 必须来自末块而不是估算");
+        assert_eq!(usage.output_tokens, 20);
+    }
+
+    /// 有些后端把 finish_reason 和 usage 放同一块，也要能收尾。
+    #[test]
+    fn single_chunk_with_finish_and_usage_still_terminates() {
+        let mut st = ChunkState::new();
+        let evs = st.feed(&json!({
+            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":7,"completion_tokens":3}
+        }));
+        let done = evs.iter().find(|e| matches!(e, UnifiedEvent::Done { .. }));
+        assert!(done.is_some());
+        // 收尾之后再来什么也不该再产出终止事件
+        assert!(st.feed(&json!({"choices":[],"usage":{"prompt_tokens":1}})).is_empty());
+    }
+
+    /// 上游完全不认 include_usage（没有 usage 块）时，靠 [DONE] 收尾。
+    /// 漏掉会让 Anthropic 客户端永久挂起。
+    #[test]
+    fn done_sentinel_terminates_when_no_usage_chunk() {
+        let mut st = ChunkState::new();
+        st.feed(&json!({"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"stop"}]}));
+        let evs = st.feed_raw("data: [DONE]\n\n").expect("哨兵应产出终止事件");
+        let UnifiedEvent::Done { finish_reason, .. } = &evs[0] else {
+            panic!("应产生 Done")
+        };
+        // finish_reason 必须跨块保留下来
+        assert_eq!(*finish_reason, Some(FinishReason::Stop));
+        // 再来一次哨兵不重复收尾
+        assert!(st.feed_raw("data: [DONE]\n\n").is_none());
+    }
+
+    #[test]
+    fn reasoning_content_becomes_reasoning_delta() {
+        let mut st = ChunkState::new();
+        let evs = st.feed(&json!({
+            "choices":[{"index":0,"delta":{"reasoning_content":"想想"},"finish_reason":null}]
+        }));
+        assert_eq!(evs, vec![UnifiedEvent::ReasoningDelta { text: "想想".into() }]);
+    }
+
+    #[test]
+    fn error_chunk_stops_the_stream() {
+        let mut st = ChunkState::new();
+        let evs = st.feed(&json!({"error":{"message":"boom","code":"x"}}));
+        assert!(matches!(&evs[0], UnifiedEvent::Error { message, .. } if message == "boom"));
+        assert!(st.feed(&json!({"choices":[{"delta":{"content":"y"}}]})).is_empty());
+    }
+
     use super::*;
 
     fn req() -> UnifiedRequest {

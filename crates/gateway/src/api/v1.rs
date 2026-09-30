@@ -97,11 +97,13 @@ pub async fn responses(
     serve(s, a.0, req, Protocol::Responses).await
 }
 
+/// 注意提取器顺序：axum 要求**所有 parts 提取器在前**，
+/// 唯一那个消费 body 的 `Json` 必须在最后。
 pub async fn messages(
     State(s): State<Arc<AppState>>,
     a: Authed,
-    body: axum::Json<Value>,
     headers: HeaderMap,
+    body: axum::Json<Value>,
 ) -> ApiResult<Response> {
     if !headers.contains_key("anthropic-version") {
         tracing::debug!("请求未带 anthropic-version，按缺失处理（不阻断）");
@@ -282,6 +284,8 @@ struct LogCtx {
     request_id: String,
     account_id: i64,
     protocol: Protocol,
+    /// 流式与非流式共用同一条落库路径，这个字段必须如实填。
+    stream: bool,
     model: String,
     node: NodeKey,
     node_name: String,
@@ -361,6 +365,7 @@ async fn run_admission(
             request_id: request_id.to_string(),
             account_id: acct.id,
             protocol,
+            stream: req.stream,
             model: req.model.clone(),
             node_name: pick.node.name.clone(),
             node: pick.key.clone(),
@@ -709,7 +714,7 @@ fn log_entry(
         node_name: Some(ctx.node_name.clone()),
         key_id: Some(ctx.node.id),
         rotated_count: ctx.rotated,
-        stream: true,
+        stream: ctx.stream,
         status: "ok",
         error_kind: None,
         error_message: None,

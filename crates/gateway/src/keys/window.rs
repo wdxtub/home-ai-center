@@ -100,6 +100,7 @@ mod tests {
             window_started_at: None,
             window_tokens_used: 0,
             state: NodeKeyState::Active,
+            last_used: None,
         }
     }
 

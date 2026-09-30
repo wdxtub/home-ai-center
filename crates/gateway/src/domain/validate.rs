@@ -163,3 +163,96 @@ mod tests {
         assert!(truncated);
     }
 }
+
+// ── 管理面写库入口用到的薄封装 ──────────────────────────────────────────────
+//
+// 运行时读路径已经假定配置是干净的，所以**所有写库入口都必须过校验**。
+
+/// 通用名称（账号 / 工作流 / 节点）。节点名另有更严的字符集要求。
+pub fn validate_name(name: &str) -> ApiResult<String> {
+    text(Some(name), "名称", true, NODE_NAME_MAX)
+}
+
+/// URL 归一化：去尾部斜杠。
+pub fn trim_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+pub fn base_url(url: &str) -> ApiResult<String> {
+    validate_http_url(url, "地址")
+}
+
+pub fn window(start: Option<u8>, end: Option<u8>) -> ApiResult<()> {
+    validate_window(start.map(|v| v as i64), end.map(|v| v as i64), Some(crate::config::DEFAULT_TZ))
+        .map(|_| ())
+}
+
+/// 并发上限。与 migration 里的 CHECK 保持一致，
+/// 否则会出现「API 放行、数据库拒绝」的怪异错误。
+pub fn max_concurrency(v: i64) -> ApiResult<()> {
+    if !(1..=MAX_NODE_CONCURRENCY).contains(&v) {
+        return Err(ApiError::bad_request(format!(
+            "并发度必须在 1–{MAX_NODE_CONCURRENCY} 之间"
+        )));
+    }
+    Ok(())
+}
+
+/// 管理员口令。家用场景不搞复杂度硬指标，但下限要有——
+/// 太短的口令等于没有口令。
+pub fn password(pw: &str) -> ApiResult<()> {
+    if pw.chars().count() < 8 {
+        return Err(ApiError::bad_request("口令至少 8 个字符"));
+    }
+    if pw.chars().count() > 256 {
+        return Err(ApiError::bad_request("口令过长"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod admin_tests {
+    use super::*;
+
+    #[test]
+    fn node_name_rejects_spaces_and_symbols() {
+        assert!(validate_node_name("lm-studio_01").is_ok());
+        assert!(validate_node_name("LM Studio").is_err());
+        assert!(validate_node_name("-leading").is_err());
+    }
+
+    #[test]
+    fn url_must_be_http_and_is_trimmed() {
+        assert_eq!(base_url("http://192.168.1.2:1234/").unwrap(), "http://192.168.1.2:1234");
+        assert!(base_url("192.168.1.2:1234").is_err());
+        assert!(base_url("ftp://x").is_err());
+    }
+
+    /// 起止相同等价于「永久禁用」，写库时就要拒绝，
+    /// 否则运行时「这个节点能不能用」没法解释。
+    #[test]
+    fn identical_window_bounds_are_rejected() {
+        assert!(validate_window(Some(3), Some(3), Some("Asia/Shanghai")).is_err());
+        assert!(validate_window(Some(23), Some(7), Some("Asia/Shanghai")).is_ok());
+        assert!(validate_window(None, None, None).is_ok());
+    }
+
+    #[test]
+    fn unknown_timezone_is_rejected() {
+        assert!(validate_window(Some(1), Some(2), Some("Mars/Olympus")).is_err());
+    }
+
+    #[test]
+    fn concurrency_bounds_match_the_database_check() {
+        assert!(max_concurrency(1).is_ok());
+        assert!(max_concurrency(64).is_ok());
+        assert!(max_concurrency(0).is_err());
+        assert!(max_concurrency(65).is_err());
+    }
+
+    #[test]
+    fn short_password_is_rejected() {
+        assert!(password("short").is_err());
+        assert!(password("long-enough-pw").is_ok());
+    }
+}

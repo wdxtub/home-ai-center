@@ -14,4 +14,6 @@ pub mod gate;
 pub mod keys;
 pub mod protocol;
 pub mod state;
+pub mod tasks;
+pub mod webui;
 pub mod upstream;

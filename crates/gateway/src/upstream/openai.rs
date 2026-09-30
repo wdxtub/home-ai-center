@@ -10,6 +10,7 @@
 
 use futures::StreamExt;
 use serde_json::Value;
+use std::collections::VecDeque;
 
 use crate::keys::classify::{self, Failure, QuotaClass, QuotaVerdict};
 use crate::protocol::ir::UnifiedEvent;
@@ -196,21 +197,40 @@ pub fn parse_sse_stream(body: reqwest::Response) -> impl futures::Stream<Item = 
             body: Box::pin(stream),
             buf: String::new(),
             eof: false,
+            // 跨事件保留 finish_reason / usage：它们分处两块
+            chunks: upstream_chat::ChunkState::new(),
+            pending: VecDeque::new(),
         },
         |mut st| async move {
             loop {
                 // SSE 以空行分隔事件；攒够一个就吐出去
                 while let Some(pos) = find_event_end(&st.buf) {
                     let raw: String = st.buf.drain(..pos).collect();
-                    if let Some(ev) = parse_one_event(&raw) {
-                        return Some((ev, st));
+                    if let Some(mut evs) = st.chunks.feed_raw(&raw) {
+                        if !evs.is_empty() {
+                            let ev = evs.remove(0);
+                            st.pending.extend(evs);
+                            return Some((ev, st));
+                        }
                     }
                 }
                 if st.eof {
                     // 最后一帧常常没有收尾空行，必须把缓冲区里剩下的也解析掉，
                     // 否则整条回复会丢掉最后一个 token。
                     let rest = std::mem::take(&mut st.buf);
-                    return parse_one_event(&rest).map(|ev| (ev, st));
+                    if let Some(mut evs) = st.chunks.feed_raw(&rest) {
+                        if !evs.is_empty() {
+                            let ev = evs.remove(0);
+                            st.pending.extend(evs);
+                            return Some((ev, st));
+                        }
+                    }
+                    // 流结束：补终止事件。三个协议都靠它收尾，
+                    // 漏掉 message_stop 会让 Anthropic SDK 永久挂起。
+                    return st.chunks.finish().into_iter().next().map(|ev| (ev, st));
+                }
+                if let Some(ev) = st.pending.pop_front() {
+                    return Some((ev, st));
                 }
                 match st.body.next().await {
                     Some(bytes) => st.buf.push_str(&String::from_utf8_lossy(&bytes)),
@@ -225,10 +245,20 @@ struct SseReader {
     body: std::pin::Pin<Box<dyn futures::Stream<Item = bytes::Bytes> + Send>>,
     buf: String,
     eof: bool,
+    chunks: upstream_chat::ChunkState,
+    pending: VecDeque<UnifiedEvent>,
 }
 
+
+/// 事件级入口。流式路径由 `parse_sse_stream` 复用同一个状态机。
+fn parse_one_event(raw: &str) -> Option<UnifiedEvent> {
+    upstream_chat::ChunkState::new()
+        .feed_raw(raw)
+        .and_then(|v| v.into_iter().next())
+}
+
+/// SSE 以空行分隔事件。空行可能是 `\n\n` 或 `\r\n\r\n`。
 fn find_event_end(buf: &str) -> Option<usize> {
-    // 空行可能是 \n\n 或 \r\n\r\n
     if let Some(i) = buf.find("\n\n") {
         return Some(i + 2);
     }
@@ -236,26 +266,6 @@ fn find_event_end(buf: &str) -> Option<usize> {
         return Some(i + 4);
     }
     None
-}
-
-fn parse_one_event(raw: &str) -> Option<UnifiedEvent> {
-    let data: Vec<&str> = raw
-        .lines()
-        .filter_map(|l| l.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect();
-    if data.is_empty() {
-        return None;
-    }
-    let payload = data.join("\n");
-    if upstream_chat::is_done_sentinel(&payload) {
-        return Some(UnifiedEvent::Done {
-            usage: Default::default(),
-            finish_reason: Some(crate::protocol::ir::FinishReason::Stop),
-        });
-    }
-    let v: Value = serde_json::from_str(&payload).ok()?;
-    upstream_chat::parse_chunk(&v).into_iter().next()
 }
 
 /// 健康探测：发一个最小 chat 请求。成功即代表推理链路真正可用。
@@ -361,19 +371,18 @@ mod tests {
             body: Box::pin(futures::stream::empty()),
             buf: "data: {\"choices\":[{\"delta\":{\"content\":\"tail\"}}]}\n\ndata: [DONE]".into(),
             eof: true,
+            chunks: upstream_chat::ChunkState::new(),
+            pending: VecDeque::new(),
         };
         // 先吃掉完整事件，缓冲区只剩没有收尾空行的最后一段
         let pos = find_event_end(&st.buf).unwrap();
         let raw: String = st.buf.drain(..pos).collect();
-        assert!(matches!(
-            parse_one_event(&raw),
-            Some(UnifiedEvent::TextDelta { .. })
-        ));
+        let evs = st.chunks.feed_raw(&raw).expect("完整事件应产出事件");
+        assert!(matches!(evs[0], UnifiedEvent::TextDelta { .. }));
+        // 缓冲区里剩下的最后一段没有收尾空行，仍要被解析出来
         let rest = std::mem::take(&mut st.buf);
-        assert!(matches!(
-            parse_one_event(&rest),
-            Some(UnifiedEvent::Done { .. })
-        ));
+        let evs = st.chunks.feed_raw(&rest).expect("无收尾空行的尾帧也不能丢");
+        assert!(matches!(evs[0], UnifiedEvent::Done { .. }));
     }
 
     #[test]

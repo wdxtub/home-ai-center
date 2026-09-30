@@ -27,6 +27,9 @@ pub struct Config {
     pub max_key_rotation: usize,
 }
 
+/// 未显式指定时区时用的默认时区（写库校验要用，不能读环境变量）。
+pub const DEFAULT_TZ: &str = "Asia/Shanghai";
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -34,7 +37,7 @@ fn env_or(key: &str, default: &str) -> String {
 impl Config {
     pub fn from_env() -> Self {
         let data_dir = PathBuf::from(env_or("HOME_AI_DATA_DIR", "./data"));
-        let timezone = env_or("HOME_AI_TIMEZONE", "Asia/Shanghai");
+        let timezone = env_or("HOME_AI_TIMEZONE", DEFAULT_TZ);
         let backup_at = env_or("HOME_AI_BACKUP_AT", "03:30");
         let admin_token = std::env::var("HOME_AI_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
 

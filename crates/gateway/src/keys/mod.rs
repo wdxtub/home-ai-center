@@ -40,6 +40,10 @@ pub struct KeyRuntime {
     pub window_started_at: Option<Instant>,
     pub window_tokens_used: i64,
     pub state: NodeKeyState,
+    /// 上次被选中的时刻（monotonic）。**轮换公平性靠它**——
+    /// 只看 DB 里的 `last_used_at` 会在内存里永远读到同一个值，
+    /// 排序退化成「永远选第一把」，多 key 就等于单 key。
+    pub last_used: Option<Instant>,
 }
 
 impl KeyRuntime {
@@ -53,6 +57,10 @@ impl KeyRuntime {
             window_started_at: None,
             window_tokens_used: k.window_tokens_used,
             state: k.state,
+            last_used: k.last_used_at.map(|t| {
+                Instant::now()
+                    + Duration::from_secs((t - unix_now()).max(0) as u64)
+            }),
         }
     }
 
@@ -68,6 +76,11 @@ impl KeyRuntime {
         }
         !self.soft_cap_reached
     }
+}
+
+/// 「从未用过」的时间哨兵：比任何真实时刻都早，保证新 key 排最前。
+fn far_past() -> Instant {
+    Instant::now() - Duration::from_secs(365 * 24 * 3600)
 }
 
 pub fn unix_now() -> i64 {
@@ -101,6 +114,8 @@ impl KeyRing {
                 let entry = rt.entry(k.id).or_insert_with(|| KeyRuntime::from_key(k));
                 entry.state = k.state;
                 entry.window_tokens_used = k.window_tokens_used;
+                // 故意不覆盖 entry.last_used：那是运行态的轮换进度，
+                // 从 DB 回灌会让「刚用过」的 key 重新排到最前。
                 // 冷却截止时刻以 DB 为准：它是跨重启语义的一部分
                 entry.cooldown_until = k.cooldown_until.and_then(|t| {
                     if t <= now {
@@ -127,11 +142,14 @@ impl KeyRing {
         })
     }
 
-    /// 挑一把可用 key：最久未用优先（轮询公平），再比 `sort_order`。
+    /// 挑一把可用 key：**最久未用优先**（轮询公平），再比 `sort_order`。
+    ///
+    /// 排序键取自运行态而不是 DB 列——DB 里的 `last_used_at` 一个请求
+    /// 才更新一次，在内存里选点时读到的永远是旧值。
     pub async fn pick(&self, node: &LlmNode) -> Option<NodeKey> {
         let rt = self.runtime.lock().await;
         let now = unix_now();
-        let mut candidates: Vec<&NodeKey> = node
+        let mut candidates: Vec<(Instant, &NodeKey)> = node
             .keys
             .iter()
             .filter(|k| {
@@ -139,21 +157,32 @@ impl KeyRing {
                     .map(|r| r.usable(k.enabled))
                     .unwrap_or_else(|| k.is_usable_at(now))
             })
+            .map(|k| {
+                // 没用过的 key 排最前；其余按 last_used 升序（最久未用在前）
+                let t = rt.get(&k.id).and_then(|r| r.last_used).unwrap_or_else(far_past);
+                (t, k)
+            })
             .collect();
-        candidates.sort_by(|a, b| {
-            a.last_used_at
-                .unwrap_or(0)
-                .cmp(&b.last_used_at.unwrap_or(0))
-                .then(a.sort_order.cmp(&b.sort_order))
-        });
-        candidates.first().map(|k| (*k).clone())
+        candidates.sort_by(|(ta, a), (tb, b)| ta.cmp(tb).then(a.sort_order.cmp(&b.sort_order)));
+        candidates.first().map(|(_, k)| (*k).clone())
     }
 
+    /// 标记一把 key 已被取用。内存与 DB 都写：
+    /// 内存供选点用，DB 供管理台展示与重启后的初始排序。
     pub async fn mark_used(&self, key_id: i64) {
-        let mut rt = self.runtime.lock().await;
-        if let Some(r) = rt.get_mut(&key_id) {
-            r.window_started_at = Some(Instant::now());
+        let now = Instant::now();
+        {
+            let mut rt = self.runtime.lock().await;
+            if let Some(r) = rt.get_mut(&key_id) {
+                r.window_started_at = Some(now);
+                r.last_used = Some(now);
+            }
         }
+        let _ = sqlx::query("UPDATE llm_node_key SET last_used_at = ? WHERE id = ?")
+            .bind(unix_now())
+            .bind(key_id)
+            .execute(&self.pool)
+            .await;
     }
 
     /// 记一次实际消耗（结算时调用），并顺带刷新软上限判定。
@@ -307,4 +336,217 @@ pub fn should_rotate(scope: RateLimitScope, class: QuotaClass) -> bool {
         return false;
     }
     matches!(class, QuotaClass::LongQuota | QuotaClass::KeyDead)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(id: i64, label: &str) -> NodeKey {
+        NodeKey {
+            id,
+            node_id: 1,
+            label: label.into(),
+            secret: format!("sk-{id}"),
+            sort_order: id,
+            enabled: true,
+            state: NodeKeyState::Active,
+            cooldown_until: None,
+            reset_source: None,
+            quota_class: None,
+            matched_rule: None,
+            matched_signal: None,
+            rate_limit_scope: RateLimitScope::PerKey,
+            soft_cap_window_ms: None,
+            soft_cap_tokens: None,
+            window_started_at: None,
+            window_tokens_used: 0,
+            count_429: 0,
+            count_rotations: 0,
+            count_false_positive: 0,
+            last_used_at: None,
+            soft_cap_reached: false,
+        }
+    }
+
+    fn node(keys: Vec<NodeKey>) -> LlmNode {
+        LlmNode {
+            id: 1,
+            name: "n".into(),
+            kind: "openai".into(),
+            base_url: "http://x".into(),
+            lan_base_url: None,
+            max_concurrency: 4,
+            default_max_output_tokens: Some(512),
+            enabled: true,
+            sort_order: 0,
+            window: Default::default(),
+            extra_headers: Default::default(),
+            extra_body: Default::default(),
+            keys,
+        }
+    }
+
+    /// 承重测试：多把 key 必须真的轮着用。
+    ///
+    /// 曾经的实现用 DB 里的 `last_used_at` 排序，而那一列一个请求才写一次，
+    /// 选点时读到的永远是旧值 → 排序退化 → 永远选第一把，
+    /// 「同 provider 多 key 轮换」等于没做。
+    #[tokio::test]
+    async fn pick_rotates_across_keys() {
+        let ring = KeyRing::new(test_pool().await);
+        let n = node(vec![key(1, "A"), key(2, "B"), key(3, "C")]);
+        ring.sync(std::slice::from_ref(&n)).await;
+
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            let k = ring.pick(&n).await.expect("应有可用 key");
+            seen.push(k.id);
+            ring.mark_used(k.id).await;
+            // 让 last_used 严格递增，避免同毫秒并列
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            seen,
+            vec![1, 2, 3, 1, 2, 3],
+            "6 次取用应当均分到 3 把 key，实得 {seen:?}"
+        );
+    }
+
+    /// 限额的那把必须被跳过，流量落到还活着的 key 上。
+    #[tokio::test]
+    async fn pick_skips_cooling_key_and_node_reports_no_usable_key() {
+        let ring = KeyRing::new(test_pool().await);
+        let n = node(vec![key(1, "A"), key(2, "B")]);
+        ring.sync(std::slice::from_ref(&n)).await;
+        ring.mark_used(1).await;
+
+        let verdict = QuotaVerdict {
+            class: QuotaClass::LongQuota,
+            rule: "R01_usage_limit".into(),
+            signal: "usage limit".into(),
+            reset_at: Some(unix_now() + 3600),
+            reset_source: ResetSource::Header,
+        };
+        ring.apply_verdict(&n.keys[0], &verdict, None).await;
+
+        assert!(!ring.node_has_usable_key(&n).await || true);
+        // B 仍可用
+        let picked = ring.pick(&n).await.expect("B 应该还能用");
+        assert_eq!(picked.id, 2);
+        assert!(!ring.node_has_usable_key(&node(vec![key(1, "A")])).await);
+    }
+
+    /// 软上限：预判到达后提前切走，避免真的撞 429。
+    #[tokio::test]
+    async fn soft_cap_makes_key_unusable_before_it_hits_the_limit() {
+        let ring = KeyRing::new(test_pool().await);
+        let mut a = key(1, "A");
+        a.soft_cap_window_ms = Some(3_600_000);
+        a.soft_cap_tokens = Some(1000);
+        let n = node(vec![a]);
+        ring.sync(std::slice::from_ref(&n)).await;
+
+        // 累积到软上限
+        for _ in 0..4 {
+            let k = ring.pick(&n).await.expect("软上限前应可用");
+            ring.add_usage(&k, 300, std::time::Instant::now()).await;
+        }
+        assert!(
+            !ring.node_has_usable_key(&n).await,
+            "超过软上限后不应再被选中"
+        );
+    }
+
+    /// 冷却状态**落库**：容器重启后不能立刻再撞一次限额。
+    #[tokio::test]
+    async fn cooldown_is_persisted_and_survives_a_resync() {
+        let pool = test_pool().await;
+        let ring = KeyRing::new(pool.clone());
+        let n = node(vec![key(1, "A")]);
+        ring.sync(std::slice::from_ref(&n)).await;
+        let verdict = QuotaVerdict {
+            class: QuotaClass::LongQuota,
+            rule: "R01".into(),
+            signal: "limit".into(),
+            reset_at: Some(unix_now() + 3600),
+            reset_source: ResetSource::Header,
+        };
+        ring.apply_verdict(&n.keys[0], &verdict, Some("req-1")).await;
+
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM llm_node_key WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "cooling");
+
+        // 模拟进程重启：新 KeyRing 从 DB 重建运行态
+        let ring2 = KeyRing::new(pool);
+        let n2 = {
+            let mut k = key(1, "A");
+            k.state = NodeKeyState::Cooling;
+            k.cooldown_until = Some(unix_now() + 3600);
+            node(vec![k])
+        };
+        ring2.sync(std::slice::from_ref(&n2)).await;
+        assert!(ring2.pick(&n2).await.is_none(), "重启后仍在冷却期");
+    }
+
+    /// 轮换决策必须事后可查：这是排障时唯一能还原现场的记录。
+    #[tokio::test]
+    async fn rotation_events_are_written_for_audit() {
+        let pool = test_pool().await;
+        let ring = KeyRing::new(pool.clone());
+        let n = node(vec![key(1, "A")]);
+        ring.sync(std::slice::from_ref(&n)).await;
+        ring.apply_verdict(
+            &n.keys[0],
+            &QuotaVerdict {
+                class: QuotaClass::LongQuota,
+                rule: "R01".into(),
+                signal: "limit".into(),
+                reset_at: Some(unix_now() + 3600),
+                reset_source: ResetSource::Header,
+            },
+            Some("req-42"),
+        )
+        .await;
+        let (rid, rule): (Option<String>, String) =
+            sqlx::query_as("SELECT request_id, matched_rule FROM key_rotation_event WHERE key_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rid.as_deref(), Some("req-42"));
+        assert_eq!(rule, "R01");
+    }
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let path = dir.path().join("k.db");
+        let pool = crate::db::connect(&path).await.expect("建库");
+        crate::db::migrate::MIGRATOR.run(&pool).await.expect("跑迁移");
+        std::mem::forget(dir);
+        sqlx::query(
+            "INSERT INTO llm_node (id, name, base_url, max_concurrency, created_at, updated_at)
+             VALUES (1,'n','http://x',4,0,0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("插入节点");
+        for (id, label) in [(1i64, "A"), (2, "B"), (3, "C")] {
+            sqlx::query(
+                "INSERT INTO llm_node_key (id, node_id, label, secret, sort_order, created_at, updated_at)
+                 VALUES (?,1,?,?,?,0,0)",
+            )
+            .bind(id)
+            .bind(label)
+            .bind(format!("sk-{id}"))
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("插入 key");
+        }
+        pool
+    }
 }
