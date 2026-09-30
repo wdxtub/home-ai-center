@@ -1,0 +1,13 @@
+# 构建只需要源码与前端工程；带上这些会让缓存失效且镜像变大。
+# 注意 web/dist **不能**加进来：它是 web 阶段的产物，
+# 被忽略后 `COPY --from=web` 会因路径不存在而失败。
+target
+data
+web/node_modules
+.git
+.github
+scripts
+.env
+.env.*
+*.md
+.DS_Store

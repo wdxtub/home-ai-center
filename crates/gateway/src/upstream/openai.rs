@@ -251,6 +251,7 @@ struct SseReader {
 
 
 /// 事件级入口。流式路径由 `parse_sse_stream` 复用同一个状态机。
+#[cfg(test)]
 fn parse_one_event(raw: &str) -> Option<UnifiedEvent> {
     upstream_chat::ChunkState::new()
         .feed_raw(raw)

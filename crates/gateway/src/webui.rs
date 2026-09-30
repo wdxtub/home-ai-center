@@ -1,7 +1,18 @@
 //! 前端静态资源托管。
 //!
 //! 镜像里内嵌 `web/dist`，单容器即可提供管理台——不需要 Nginx，
-//! 也不需要额外拷文件。开发时用 Vite dev server 代理到后端。
+//! 也不需要额外拷文件。
+//!
+//! ## 这是一个**编译期**依赖
+//!
+//! `include_dir!` 在 `cargo build` 时就把 `web/dist` 打进二进制，因此
+//! **必须先 `npm run build` 再 `cargo build`**，顺序反了会编译失败。
+//! `web/dist` 因此被 gitignore：它是产物，不是源码。
+//! Dockerfile 与 CI 都是「先前端、后后端」两段构建，正是为此。
+//!
+//! 目录完全不存在时 `include_dir!` 会 panic——这是刻意的：
+//! 镜像里没有前端说明构建漏了步，应该当场失败，而不是起一个
+//! 所有人都看到 404 的服务。
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -9,8 +20,6 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use include_dir::{include_dir, Dir};
 
-/// 编译期内嵌。目录不存在时 `include_dir!` 会 panic——
-/// 这是**刻意的**：镜像里没有前端说明构建漏了步，应该当场失败。
 static ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../web/dist");
 
 /// SPA 回退：任何未匹配的路径都交给前端路由处理。

@@ -1,0 +1,25 @@
+services:
+  gateway:
+    build: .
+    image: home-ai-center:latest
+    container_name: home-ai-center
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # 唯一需要持久化的东西。SQLite、每日备份、图片归档都在这下面。
+      - ./data:/data
+    environment:
+      # 首次启动用它初始化管理员口令（用户名固定 admin）。
+      # 初始化之后改这个变量不会影响已存的口令，要改请到「设置 → 管理员」。
+      HOME_AI_ADMIN_TOKEN: "${HOME_AI_ADMIN_TOKEN:?请先在 .env 里设置管理台口令}"
+      HOME_AI_TIMEZONE: "${HOME_AI_TIMEZONE:-Asia/Shanghai}"
+      # 每日备份时刻（本地时间）
+      HOME_AI_BACKUP_AT: "${HOME_AI_BACKUP_AT:-03:30}"
+      # 节点健康复检间隔（秒）
+      HOME_AI_PROBE_INTERVAL: "${HOME_AI_PROBE_INTERVAL:-15}"
+      # 单次请求排队等待上限（秒）
+      HOME_AI_QUEUE_TIMEOUT: "${HOME_AI_QUEUE_TIMEOUT:-120}"
+      # 单个请求内最多轮换几把 key
+      HOME_AI_MAX_KEY_ROTATION: "${HOME_AI_MAX_KEY_ROTATION:-3}"
+      HOME_AI_LOG: "${HOME_AI_LOG:-info,hac=debug,sqlx=warn}"

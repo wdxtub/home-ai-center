@@ -1197,14 +1197,33 @@ pub async fn dry_run_workflow(
     Path(id): Path<i64>,
     Json(b): Json<DryRunBody>,
 ) -> ApiResult<Json<Value>> {
-    let r = sqlx::query("SELECT comfy_workflow FROM workflow WHERE id = ?")
+    let r = sqlx::query("SELECT comfy_workflow, param_slots FROM workflow WHERE id = ?")
         .bind(id)
         .fetch_optional(&s.pool)
         .await?
         .ok_or_else(|| ApiError::not_found("工作流不存在"))?;
     let tpl: Value = serde_json::from_str(&r.get::<String, _>("comfy_workflow"))
         .map_err(|e| ApiError::bad_request(format!("工作流 JSON 解析失败：{e}")))?;
+    // 槽位过滤要和真实提交路径**用同一套规则**，否则试跑通过、
+    // 实际调用却被拒，排障时会怀疑是别的地方坏了。
     let params = b.params.as_object().cloned().unwrap_or_default();
+    let declared: std::collections::HashSet<String> =
+        serde_json::from_str::<Vec<String>>(&r.get::<String, _>("param_slots"))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    let unknown: Vec<&str> = params
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !declared.contains(*k))
+        .collect();
+    if !unknown.is_empty() {
+        return Ok(Json(json!({
+            "ok": false,
+            "error": format!("工作流没有这些参数槽：{}", unknown.join(", ")),
+        })));
+    }
+
     match crate::upstream::workflow::render(&tpl, &params) {
         Ok((v, used)) => Ok(Json(json!({ "ok": true, "used": used, "workflow": v }))),
         Err(e) => Ok(Json(json!({ "ok": false, "error": e.0 }))),
@@ -1299,7 +1318,13 @@ pub async fn overview(State(s): Shared, _a: AdminAuthed) -> ApiResult<Json<Value
 
     let snap = s.snapshot();
     let health = s.health.snapshot().await;
-    let healthy = health.values().filter(|h| h.healthy).count();
+    // 分母是节点总数：没有健康记录的节点就是健康的（还没失败过）。
+    // 只数 health 里的条目会让「一个节点都没出问题」显示成 0 个健康。
+    let healthy = snap
+        .nodes
+        .iter()
+        .filter(|n| health.get(&n.id).map(|h| h.healthy).unwrap_or(true))
+        .count();
     let cooling = health.values().filter(|h| h.cooldown_secs_remaining > 0).count();
 
     Ok(Json(json!({

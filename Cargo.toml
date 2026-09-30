@@ -49,3 +49,9 @@ sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
 uuid = { version = "1", features = ["v4"] }
+
+# 必须在 workspace 根：成员 crate 里的 [profile] 会被 Cargo 静默忽略
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

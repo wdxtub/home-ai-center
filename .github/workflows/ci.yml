@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 前端
+        run: |
+          cd web
+          npm ci
+          npm run build
+      - name: SQL 审计
+        # 漏绑与 INSERT 列数不符，编译期查不出、运行时才炸
+        run: python3 scripts/audit_sql.py
+      - name: 测试
+        run: cargo test --all
+      - name: 格式
+        run: cargo fmt --all --check
+      - name: 构建
+        run: cargo clippy --all-targets -- -D warnings
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      # 顺序不能反：include_dir! 在编译期内嵌 web/dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cd web && npm ci && npm run build
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: home-ai-center:ci
