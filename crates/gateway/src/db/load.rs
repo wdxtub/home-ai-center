@@ -66,7 +66,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> anyhow::Result<Snapshot> {
         "SELECT id, node_id, label, secret, sort_order, enabled, state, cooldown_until,
                 reset_source, quota_class, matched_rule, matched_signal, rate_limit_scope,
                 soft_cap_window_ms, soft_cap_tokens, window_started_at, window_tokens_used,
-                count_429, count_rotations, count_false_positive, last_used_at
+                count_429, count_rotations, last_used_at
          FROM llm_node_key ORDER BY node_id, sort_order, id",
     )
     .fetch_all(pool)
@@ -109,7 +109,6 @@ pub async fn load_snapshot(pool: &SqlitePool) -> anyhow::Result<Snapshot> {
             window_tokens_used,
             count_429: r.get("count_429"),
             count_rotations: r.get("count_rotations"),
-            count_false_positive: r.get("count_false_positive"),
             last_used_at: r.get("last_used_at"),
             soft_cap_reached,
         });
@@ -168,13 +167,18 @@ pub async fn load_snapshot(pool: &SqlitePool) -> anyhow::Result<Snapshot> {
 
     // ── 工作流 ──
     for r in sqlx::query(
-        "SELECT id, name, mode, node_ids, comfy_workflow, param_slots, price_micro,
-                enabled, archive, archive_retention_days
+        "SELECT id, name, mode, node_ids, comfy_workflow, price_micro, enabled
          FROM workflow ORDER BY id",
     )
     .fetch_all(pool)
     .await?
     {
+        let comfy_workflow: serde_json::Value =
+            serde_json::from_str(&r.get::<String, _>("comfy_workflow"))
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+        // 推不出模型名不是致命错误（raw 通道本来就没有），留空串由
+        // resolve_by_model 报错——加载期 panic 会让整个网关起不来。
+        let model = crate::domain::workflow::derive_model(&comfy_workflow).unwrap_or_default();
         snap.workflows.push(Workflow {
             id: r.get("id"),
             name: r.get("name"),
@@ -184,14 +188,10 @@ pub async fn load_snapshot(pool: &SqlitePool) -> anyhow::Result<Snapshot> {
                 WorkflowMode::Template
             },
             node_ids: serde_json::from_str(&r.get::<String, _>("node_ids")).unwrap_or_default(),
-            comfy_workflow: serde_json::from_str(&r.get::<String, _>("comfy_workflow"))
-                .unwrap_or(serde_json::Value::Object(Default::default())),
-            param_slots: serde_json::from_str(&r.get::<String, _>("param_slots"))
-                .unwrap_or_default(),
+            comfy_workflow,
+            model,
             price_micro: r.get("price_micro"),
             enabled: r.get::<i64, _>("enabled") != 0,
-            archive: r.get::<i64, _>("archive") != 0,
-            archive_retention_days: r.get("archive_retention_days"),
         });
     }
 

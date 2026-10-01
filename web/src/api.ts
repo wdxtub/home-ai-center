@@ -89,7 +89,6 @@ export interface Account {
   llm_max_queue: number
   image_max_concurrency: number
   image_max_queue: number
-  rpm_limit: number | null
   created_at: number
 }
 
@@ -188,13 +187,28 @@ export interface Workflow {
   id: number
   name: string
   mode: 'template' | 'raw'
+  /**
+   * 调用方在请求体顶层传的 model。不是存出来的，是从 comfy_workflow 的
+   * checkpoint 文件名推的（见 domain/workflow.ts 的 derive_model）。
+   * 改 checkpoint 就等于改 model id，现有调用方会立刻 404。
+   */
+  model: string
+  /** 推不出 model 时的原因；非空说明这条工作流没法按 model 选到 */
+  model_error: string
   node_ids: number[]
-  param_slots: string[]
+  /** 网关全局固定的参数面，不是每个工作流各报各的 */
+  allowed_params: string[]
+  /** 固定尺寸组合：只有这两组，调用方不传具体像素 */
+  sizes: { size: string; width: number; height: number }[]
   price_micro: number
   enabled: boolean
-  archive: boolean
-  archive_retention_days: number | null
   has_workflow_json: boolean
+}
+
+export interface WorkflowList {
+  items: Workflow[]
+  /** size 不传时用哪一组 */
+  default_size: string
 }
 
 export interface LogRow {
@@ -220,6 +234,8 @@ export interface LogRow {
   tokens_source: string | null
   image_count: number
   cost_micro: number
+  /** 出图提示词。只有出图行且记录成功时才有这个字段。 */
+  prompt?: string
   created_at: number
 }
 

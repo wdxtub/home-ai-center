@@ -15,7 +15,6 @@ pub struct Account {
     pub llm_max_queue: i64,
     pub image_max_concurrency: i64,
     pub image_max_queue: i64,
-    pub rpm_limit: Option<i64>,
 }
 
 impl Account {

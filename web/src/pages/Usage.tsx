@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
-  Card, Table, Tag, Space, Typography, Select, DatePicker, Input, Row, Col, Statistic, Space as AntSpace,
+  Card, Table, Tag, Space, Typography, Select, DatePicker, Input, Row, Col, Statistic,
+  Tooltip, Space as AntSpace,
 } from 'antd'
 import dayjs, { type Dayjs } from 'dayjs'
 import { api, type LogRow, type SummaryRow, type Account } from '../api'
@@ -205,6 +206,24 @@ export default function Usage() {
                 v ? <Tag>{v === 'messages' ? 'anthropic' : v}</Tag> : <Tag>—</Tag>,
             },
             { title: '目标', dataIndex: 'target', width: 150 },
+            {
+              // 只有出图有：LLM 请求的提示词按产品决策不落库，这一列恒为 —
+              title: '提示词',
+              dataIndex: 'prompt',
+              width: 240,
+              render: (v: string | undefined, r) =>
+                v ? (
+                  <Tooltip title={v}>
+                    <Typography.Text ellipsis style={{ maxWidth: 220, fontSize: 12 }}>
+                      {v}
+                    </Typography.Text>
+                  </Tooltip>
+                ) : (
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    {r.kind === 'image' ? '未记录' : '—'}
+                  </Typography.Text>
+                ),
+            },
             {
               title: '节点',
               dataIndex: 'node_name',

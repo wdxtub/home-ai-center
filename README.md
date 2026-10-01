@@ -145,11 +145,11 @@ curl http://localhost:8080/v1/messages \
   -H "content-type: application/json" \
   -d '{"model":"qwen3-8b","max_tokens":256,"messages":[{"role":"user","content":"你好"}]}'
 
-# 出图
+# 出图：顶层传 model（只有一个模型时可省），params 里只有 prompt / size / seed
 curl http://localhost:8080/v1/images/generations \
   -H "Authorization: Bearer sk-hac-xxx" \
   -H "content-type: application/json" \
-  -d '{"workflow":"txt2img","params":{"prompt":"一只猫","seed":42}}'
+  -d '{"model":"z_image_turbo-Q8_0","params":{"prompt":"一只猫","size":"3x4","seed":42}}'
 ```
 
 换成现成客户端只要改 `base_url`：
@@ -179,23 +179,111 @@ client = OpenAI(base_url="http://localhost:8080/v1", api_key="sk-hac-xxx")
 - **模板**（默认）：服务端存 ComfyUI workflow JSON，客户端只传参数
 - **raw**：客户端直接提交完整 workflow
 
-模板里用占位符：
+### 选模型，不选工作流
+
+调用方传的是 `model`，工作流是网关内部的实现细节：
+
+```json
+{"model": "z_image_turbo-Q8_0", "params": {"prompt": "一只猫", "size": "3x4", "seed": 42}}
+```
+
+`model` 放**请求体顶层**（和 `/v1/chat/completions`、OpenAI 的出图端点一致），
+不在 `params` 里 —— `params` 是模板占位符的白名单。
+
+模型名不是存在库里的字段，而是**从模板的 checkpoint 文件名推出来的**
+（`domain::workflow::derive_model`）。单一事实来源，不会出现「换了模型忘了改名字」。
+只认主模型加载器（`UnetLoaderGGUF` / `UNETLoader` / `CheckpointLoaderSimple` 这类），
+VAE 和 CLIP 不算 —— 换 `flux_ae.safetensors` 之类是无害的组件升级，不该改掉调用方
+看到的 model 名。
+
+> **改 checkpoint 文件名就等于改 model。** 现有调用方会立刻 404。
+> 管理台「出图」和导入报告都会把推导出来的名字显式列出来，就是为了让这件事
+> 在改动当场看得见。
+
+可选值查 `GET /v1/workflows`。只有一个启用的模型时不传 `model` 也能用；
+**多于一个必须显式指定**，否则报错并列出所有可选项 —— 不会替你挑一个。
+同一个模型挂了两条启用的工作流同样报错，那是「又导入了重复模板」的信号。
+
+请求体顶层**再传 `workflow` 会直接 400**。body 是裸 JSON，多余字段默认被静默
+吞掉 —— 那样调用方会以为自己在选工作流，实际拿到的是默认那条。宁可报错也要说。
+
+### 只能传三个参数
+
+模板模式下，调用方**只能传这三个**：
+
+| 参数 | 说明 |
+| --- | --- |
+| `prompt` | 提示词 |
+| `size` | 尺寸，只有 `3x4` / `16x9` 两组。**不传则缺省 `3x4`** |
+| `seed` | 随机种子，留着是为了能重跑出同一张图 |
+
+传别的直接报错，并在错误里列出能传哪几个
+（`domain::workflow::ALLOWED_PARAM_SLOTS` 是唯一权威定义，真实提交与「试跑」共用同一份）。
+
+这是刻意收紧的：参数面越小，能被调用方注入的东西越少，「这张图长什么样」
+就越由服务端模板决定。反向提示词、采样步数、denoise 之类**全部固定在模板里**。
+
+### 尺寸不自由传
+
+`width` / `height` **不在允许集里** —— 调用方碰不到具体像素，只能在两组预设里选：
+
+| `size` | 实际像素 |
+| --- | --- |
+| `3x4` | 768 x 1024 |
+| `16x9` | 1024 x 576 |
+
+网关把 `size` 展开成 `width` / `height` 填进模板的占位符
+（`domain::workflow::SIZE_PRESETS` 是唯一权威位置），**所以模板照旧写
+`{{width}}` / `{{height}}`，不用跟着改**。
+
+`size` 不传时网关补 `3x4`，**不落到模板的 `{{width|768}}` 上**——
+工作流去重成一条之后，那个模板默认值不该再是一个没登记过的隐式尺寸。
+只有模板真的引用到宽高占位符时才会注入；`zit-img2img` 没有，
+无脑注入会让调用方只传了 `size` 却收到「没有消费这些参数：width, height」。
+
+两组都是精确比例且按 16 对齐（latent 尺寸不是 16 的倍数时，部分采样器会自己裁）。
+
+`GET /v1/workflows` 同时返回 `params` 和 `sizes`，调用方不用猜。
+
+
+### 模板里想固定值，就写默认值
 
 ```json
 {
   "1": { "class_type": "TextEncode", "inputs": { "text": "{{prompt}}" } },
+  "2": { "class_type": "TextEncode", "inputs": { "text": "{{negative_prompt|}}" } },
   "6": { "class_type": "EmptyLatentImage", "inputs": { "width": "{{width|1024}}" } }
 }
 ```
 
-两条规则：
+三条规则：
 
 1. **整串就是占位符**时保留 JSON 类型——`{{seed}}` 变成数字 `42` 而不是字符串 `"42"`，
    否则 ComfyUI 校验直接报错。
 2. **传了模板没消费的参数会报错**。静默丢弃会让「设了 seed 却每次出图一样」
    这类问题永远查不出来。
+3. **占位符填不上时，两类分开处理**：
+   - 属于允许集（`prompt` / `size` / `seed`）→ **出图前直接拒绝**。
+     否则 `{{seed}}` 字面量会送到 ComfyUI，调用方拿到的是
+     「Prompt outputs failed validation」，看不出是自己少传了 seed。
+   - 不属于允许集（`negative_prompt` 等，调用方永远传不进来）→ 放行，
+     只在日志和「试跑」的 `unresolved` 里提醒模板作者加默认值
+     （`{{negative_prompt|}}`）。不该让调用方为模板的问题背锅。
+
+   这条最容易被忽略：`TextEncode` 不会报错，它会把 `{{negative_prompt}}`
+   这串字面量**当成提示词原文**发给模型，图就废了而且没人察觉。
 
 改工作流时先用「试跑」验证填充结果——它和真实提交走同一套校验规则。
+
+### 图归谁存
+
+**网关不存图。** 响应里只有 `b64_json` 和 `filename`，图片由调用方自己落盘。
+这既省掉一个只增不减、还要额外做保留期的目录，也避免了备份时把图片一起复制走。
+
+代价是「这张图是哪句话生成的」这条线索断了，所以补了一张 `image_prompt` 表：
+出图成功时记下 `params.prompt`（raw 模式没有具名提示词，记空串），
+用量页的明细表里能直接看到。它是**唯一被记录的请求正文**，LLM 侧仍然一字不记。
+保留期跟随调用明细，见「数据与备份」。
 
 ---
 
@@ -225,7 +313,7 @@ Chat 末块 `choices` 是空数组，跟着协议走账就错了。
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `HOME_AI_DATA_DIR` | `./data` | 数据目录：SQLite、备份、图片归档 |
+| `HOME_AI_DATA_DIR` | `./data` | 数据目录：SQLite、备份 |
 | `HOME_AI_BIND` | `0.0.0.0:8080` | 监听地址 |
 | `HOME_AI_ADMIN_TOKEN` | — | **首次启动**用于初始化管理员口令（用户名 `admin`） |
 | `HOME_AI_TIMEZONE` | `Asia/Shanghai` | 禁用时段与每日分桶用的时区 |
@@ -244,10 +332,12 @@ Chat 末块 `choices` 是空数组，跟着协议走账就错了。
 ```
 /data
 ├── home-ai-center.db        # 全部配置与数据
-├── backups/                 # 每日备份，滚动 7 天
-│   └── hac-20260115-033000.db
-└── images/<request_id>/     # 出图归档（仅工作流开启归档时）
+└── backups/                 # 每日备份，滚动 7 天
+    └── hac-20260115-033000.db
 ```
+
+数据目录里**没有图片**。出图的图以 base64 直接回给调用方，由调用方自己保存；
+网关只留出图提示词（`image_prompt` 表）和计费明细。
 
 备份用 SQLite 的 `VACUUM INTO`：**一致性快照，且只取读锁，不阻塞在线写入**。
 
@@ -256,6 +346,13 @@ Chat 末块 `choices` 是空数组，跟着协议走账就错了。
 > 中途失败只会多一个 `.tmp`，不会留下「看起来正常其实是半截」的文件。
 
 调用明细默认保留 90 天（`setting` 表里的 `log_retention_days`），`usage_daily` 永久保留。
+出图提示词跟着明细一起清（`image_prompt.request_id` 上有 `ON DELETE CASCADE`）——
+提示词和明细分开存只是为了让 `request_log` 保持「不存正文」的定位，
+不是给它开一条永不过期的后门。
+
+保留期在管理台「设置 → 数据保留」里改。数据目录里那个旧的 `images/`
+是归档时代的遗留：空的会被启动时清掉，里面还有文件的只会告警、
+需要你手动删 —— 网关不会替你删可能是唯一一份的图。
 
 ---
 
@@ -264,7 +361,7 @@ Chat 末块 `choices` 是空数组，跟着协议走账就错了。
 ```bash
 # 后端
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p home-ai-center --lib      # 179 项
+cargo test -p home-ai-center --lib      # 195 项
 cargo run -p home-ai-center
 
 # 前端（另开一个终端）
@@ -331,6 +428,9 @@ python3 scripts/audit_sql.py
 
 - **多机 / 多副本分布式调度**。单进程单库，调度状态在内存里。
 - **TLS 终止与反向代理**。默认 HTTP，套 Nginx / Caddy 即可。
-- **记录 prompt / completion 正文**。产品决策：正文最占空间，而排查问题需要的
-  「谁、何时、调了哪个模型、多少钱」都在明细里。
+- **记录 LLM 的 prompt / completion 正文**。产品决策：正文最占空间，而排查问题需要的
+  「谁、何时、调了哪个模型、多少钱」都在明细里。**出图是唯一的例外**，见「出图」。
+- **在网关留图片**。图片由调用方自己保存，网关只在响应里回 base64。
+- **让调用方自由指定出图参数**。模板模式只接受 `prompt` / `width` / `height` / `seed`，
+  其余固定在模板里；`raw` 模式是另一条通道，本来就是整份 workflow 自行提交。
 - **自动探测后端参数**。关思考的参数各家不统一，逐节点配比猜更可靠。

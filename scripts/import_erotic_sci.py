@@ -46,6 +46,56 @@ MICRO_PER_YUAN = 1_000_000
 # 所以这类工作流导入后一律停用 —— 停了不会误报可用，启用了必然失败。
 NEEDS_UPLOAD_SLOTS = {"image", "init_image", "image_url"}
 
+# 网关侧的唯一权威定义是 domain::workflow::ALLOWED_PARAM_SLOTS。
+# 这里只用来在导入报告里提示「哪些槽位调用方传不进来，得在模板里写死」，
+# 改那边记得同步这里。
+ALLOWED_PARAM_SLOTS = {"prompt", "size", "seed"}
+
+# width / height 调用方也传不进来，但**它们不需要在模板里写死**：
+# 网关把 size 展开成像素直接注入这两个槽（upstream::workflow::prepare_slots）。
+# 把它们算进「需写死」会让用户把尺寸改回 `{{width|768}}` 写死，
+# 正好把 size 功能改坏。判据是「谁会填上它」，不是「调用方能不能传」。
+GATEWAY_FILLED_SLOTS = ALLOWED_PARAM_SLOTS | {"width", "height"}
+
+# 主模型 checkpoint 的加载器：(class_type, inputs 里的字段名)。
+# 必须和 crates/gateway/src/domain/workflow.rs 的 MODEL_LOADERS 一致——
+# 两边对不上时，脚本报告的 model 和网关实际认的会对不上，而用户只会
+# 看到「网关说没这个模型」。VAE / CLIP / LoRA 加载器刻意不在表里。
+MODEL_LOADERS = {
+    "CheckpointLoaderSimple": "ckpt_name",
+    "ImageOnlyCheckpointLoader": "ckpt_name",
+    "UNETLoader": "unet_name",
+    "UnetLoader": "unet_name",
+    "UNETLoaderGGUF": "unet_name",
+    "UnetLoaderGGUF": "unet_name",
+}
+MODEL_EXTENSIONS = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin")
+
+
+def derive_model_id(comfy_workflow: Any) -> str:
+    """从 ComfyUI 图里推出模型 id；推不出来返回空串。"""
+    if not isinstance(comfy_workflow, dict):
+        return ""
+    found = set()
+    for node in comfy_workflow.values():
+        if not isinstance(node, dict):
+            continue
+        field = MODEL_LOADERS.get(node.get("class_type"))
+        if not field:
+            continue
+        raw = (node.get("inputs") or {}).get(field)
+        if not isinstance(raw, str):
+            continue
+        name = raw.strip()
+        for ext in MODEL_EXTENSIONS:
+            if name.endswith(ext):
+                name = name[: -len(ext)]
+                break
+        if name:
+            found.add(name)
+    # 多个不同模型时网关会报错，这里也只报得出一个——取排好序的第一个
+    return sorted(found)[0] if found else ""
+
 
 # ── HTTP ────────────────────────────────────────────────────────────────────
 
@@ -152,6 +202,21 @@ def template_slots(doc: Any) -> list[str]:
     return sorted(found)
 
 
+def size_agnostic_fingerprint(text: str) -> str:
+    """抹掉宽高占位符的默认值，算出「忽略尺寸后」的工作流指纹。
+
+    `{{width|768}}` 和 `{{width|1024}}` 只是把 SIZE_PRESETS 里不同的那组
+    尺寸写死在模板里。网关现在由调用方的 size 统一展开宽高，所以这些默认值
+    不该算作两条不同的工作流——否则报告会谎称「它们只是尺寸不同」，
+    而对 `zit-img2img` 这种真正的另一个模板，那句话是假的。
+    """
+    def _strip(m: re.Match[str]) -> str:
+        name = m.group(1).split("|")[0].strip()
+        return "{{" + name + "}}"
+
+    return PLACEHOLDER.sub(_strip, text)
+
+
 def load_source(src: Path) -> dict[str, Any]:
     ingest = yaml.safe_load((src / "config" / "ingest.yaml").read_text(encoding="utf-8"))
     remotes = ingest["llm"]["lmstudio"]["remotes"]
@@ -167,6 +232,7 @@ def load_source(src: Path) -> dict[str, Any]:
                 "name": f.stem,
                 "json": text,
                 "param_slots": slots,
+                "fingerprint": size_agnostic_fingerprint(text),
                 # 需要上传图片的槽位，网关目前满足不了。
                 "blocked": sorted(NEEDS_UPLOAD_SLOTS & set(slots)),
             }
@@ -187,6 +253,19 @@ def load_source(src: Path) -> dict[str, Any]:
 def build_plan(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     nodes, routes = [], []
     seen_model_priority: dict[str, int] = {}
+
+    # 归一化指纹留给下面判重：--image-workflow 指名的那条
+    selected_fp = next(
+        (w["fingerprint"] for w in cfg["workflows"] if w["name"] == args.image_workflow),
+        None,
+    )
+    if selected_fp is None:
+        # 名字打错时 plan["workflows"] 会是空的，脚本却一路跑到「导入成功」，
+        # 留下一个只有 LLM 节点、没有出图能力的库，而且报告一个字都不提。
+        have = "、".join(w["name"] for w in cfg["workflows"]) or "（源仓库里一个都没有）"
+        raise SystemExit(
+            f"✗ --image-workflow {args.image_workflow} 在源仓库里不存在。可选：{have}"
+        )
 
     for idx, r in enumerate(cfg["remotes"]):
         name = str(r["name"])
@@ -213,7 +292,6 @@ def build_plan(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
                 "disabled_timezone": window.get("timezone"),
                 "extra_headers": {},
                 "extra_body": extra_body,
-                "capabilities": {},
                 "_key": str(r.get("api_key") or ""),
             }
         )
@@ -269,14 +347,32 @@ def build_plan(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
                 "name": w["name"],
                 "mode": "template",
                 "comfy_workflow": w["json"],
-                "param_slots": w["param_slots"],
                 "price_micro": args.image_price_micro,
                 "enabled": not w["blocked"],
-                "archive": False,
-                "archive_retention_days": None,
                 "_blocked": w["blocked"],
+                # 模板里扫出来的槽位只用于**报告**：告诉用户哪些占位符
+                # 调用方已经传不进来了，得在模板里写死。不再发给网关——
+                # 网关的允许集是全局固定的，不按工作流声明。
+                "_slots": w["param_slots"],
             }
             for w in cfg["workflows"]
+            if w["name"] == args.image_workflow
+        ],
+        # 源仓库里没被选中的模板，用于在报告里说明「跳过了什么、为什么」。
+        # 区分「只是尺寸不同」和「真的是另一个模板」：前者是重复项，
+        # 后者是本次没导入的**能力**（比如 img2img），两者对用户意义完全不同，
+        # 混成一句话就是在骗人。
+        "skipped_workflows": [
+            {
+                "name": w["name"],
+                "duplicate_of": (
+                    args.image_workflow
+                    if selected_fp is not None and w["fingerprint"] == selected_fp
+                    else None
+                ),
+            }
+            for w in cfg["workflows"]
+            if w["name"] != args.image_workflow
         ],
         "account": {
             "name": args.account_name,
@@ -382,9 +478,36 @@ def apply_plan(cli: Client, plan: dict[str, Any], rep: Report) -> None:
         else:
             cli.post("/api/admin/workflows", body)
             rep.created.append(f"工作流 {w['name']}")
-        slots = "、".join(w["param_slots"])
         mark = "" if w["enabled"] else f"  停用（需要 {', '.join(w['_blocked'])} 槽，网关不能上传）"
-        rep.line("工作流", f"{w['name']}  槽位：{slots}  单价 {w['price_micro']} 微元{mark}")
+        # 网关只接受 prompt / size / seed；size 由网关展开成 width/height 注入。
+        # 模板里其余的占位符调用方传不进来，得靠模板自己的默认值（`{{name|}}`），
+        # 否则 TextEncode 会把那串字面量当提示词用。
+        stray = [s for s in w["_slots"] if s not in GATEWAY_FILLED_SLOTS]
+        fix = f"  ⚠ 需在模板里写死：{', '.join(stray)}" if stray else ""
+        # 模型名是网关从模板里推的，不是存出来的列（domain::workflow::derive_model）。
+        # 报告里显式写出来，是因为**改 checkpoint 文件名就等于改 model**，
+        # 调用方会立刻 404——这件事只在导入时能提前看到。
+        model = derive_model_id(w["comfy_workflow"])
+        mtag = (
+            f"  model={model}"
+            if model
+            else "  ⚠ 模板里认不出主模型 checkpoint，这条导入后没法按 model 选到"
+        )
+        rep.line("工作流", f"{w['name']}  单价 {w['price_micro']} 微元{mtag}{mark}{fix}")
+
+    if plan.get("skipped_workflows"):
+        only = plan["workflows"][0]["name"] if plan["workflows"] else "所选"
+        dupes = [s["name"] for s in plan["skipped_workflows"] if s["duplicate_of"]]
+        others = [s["name"] for s in plan["skipped_workflows"] if not s["duplicate_of"]]
+        parts = []
+        if dupes:
+            parts.append(f"{'、'.join(dupes)} 与 {only} 归一化后相同，只是尺寸不同")
+        if others:
+            parts.append(
+                f"{'、'.join(others)} 是**另一个模板**（尺寸参数不同就不算重复），"
+                f"本次没导；要换成它用 --image-workflow 指名"
+            )
+        rep.line("跳过", "；".join(parts))
 
     a = plan["account"]
     existing_acc = {x["name"]: x for x in cli.get("/api/admin/accounts")["items"]}
@@ -433,6 +556,11 @@ def main() -> int:
     ap.add_argument("--image-price-micro", type=int, default=100_000,
                     help="每张图的微元单价。**不能是 0**：网关对未配价的工作流"
                          "直接拒绝出图。默认 100000 微元 = 0.1 元/张。")
+    ap.add_argument("--image-workflow", default="zit-scene",
+                    help="要导入的出图工作流名。网关的出图只有一条工作流，"
+                         "尺寸由调用方的 size 决定，所以只导这一条；"
+                         "源仓库里其余模板（zit-1024 / zit-cover-3x4）与它"
+                         "归一化后完全相同，只是把尺寸提前固化进了副本。")
     ap.add_argument("--comfy-node-name", default="n1-comfy")
     ap.add_argument("--comfy-max-concurrency", type=int, default=2)
     ap.add_argument("--disable-nodes", nargs="*", default=["m2"],
@@ -456,11 +584,19 @@ def main() -> int:
           f"ComfyUI 端点 {len(plan['comfy_nodes'])} 个\n")
 
     if args.dry_run:
-        print(json.dumps(
-            {k: [{kk: ("***" if kk in ("_key", "password") else vv)
-                  for kk, vv in (v.items() if isinstance(v, dict) else [])} for v in vs]
-             for k, vs in plan.items()},
-            ensure_ascii=False, indent=2)[:4000])
+        def _mask(vs):
+            # 列表里可能是 dict（要脱敏），也可能是纯字符串（如跳过的工作流名）
+            out = []
+            for v in vs:
+                if isinstance(v, dict):
+                    out.append({kk: ("***" if kk in ("_key", "password") else vv)
+                                for kk, vv in v.items()})
+                else:
+                    out.append(v)
+            return out
+
+        print(json.dumps({k: _mask(vs) for k, vs in plan.items()},
+                         ensure_ascii=False, indent=2)[:4000])
         print("\n（dry-run，未连接网关）")
         return 0
 

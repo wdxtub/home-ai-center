@@ -140,7 +140,6 @@ pub struct NodeKey {
     pub window_tokens_used: i64,
     pub count_429: i64,
     pub count_rotations: i64,
-    pub count_false_positive: i64,
     pub last_used_at: Option<i64>,
 
     /// 运行时的软上限判断结果，由 `keys::window` 计算后回填。
@@ -211,7 +210,6 @@ mod tests {
             window_tokens_used: 0,
             count_429: 0,
             count_rotations: 0,
-            count_false_positive: 0,
             last_used_at: None,
             soft_cap_reached: false,
         }

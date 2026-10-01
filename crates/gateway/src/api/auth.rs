@@ -80,7 +80,6 @@ pub async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> 
         llm_max_queue: row.get("llm_max_queue"),
         image_max_concurrency: row.get("image_max_concurrency"),
         image_max_queue: row.get("image_max_queue"),
-        rpm_limit: row.get("rpm_limit"),
     })
 }
 

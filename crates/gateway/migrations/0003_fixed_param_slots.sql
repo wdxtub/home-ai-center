@@ -1,0 +1,14 @@
+-- 出图参数面收紧为全局固定集（prompt / width / height / seed），
+-- 「每个工作流自己声明 param_slots」这个设计随之退休，删列。
+--
+-- 为什么不再按工作流声明：
+--   参数面越小，能被调用方注入的东西越少。原来的 param_slots 是从模板里
+--   扫出来的，等于把「调用方能改什么」交给了模板作者；现在改成一个常量
+--   （`domain::workflow::ALLOWED_PARAM_SLOTS`），真实提交路径与「试跑」
+--   共用同一份定义，不会出现「试跑通过、实际被拒」。
+--
+--   少了的 negative_prompt、steps、denoise 这些改在模板里写死，
+--   靠 `{{negative_prompt|}}` 这种带默认值的占位符语法。
+--
+-- 旧值不迁移：留着一份「曾经允许什么」的列表只会让人以为它还生效。
+ALTER TABLE workflow DROP COLUMN param_slots;

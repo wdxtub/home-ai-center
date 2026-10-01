@@ -5,7 +5,7 @@ import {
   App, Popconfirm, Tabs, Alert, Tooltip, Select,
 } from 'antd'
 import { PlusOutlined, EditOutlined, DeleteOutlined, PlayCircleOutlined, NodeIndexOutlined } from '@ant-design/icons'
-import { api, type ComfyNode, type Workflow } from '../api'
+import { api, type ComfyNode, type Workflow, type WorkflowList } from '../api'
 import { money } from '../format'
 
 export default function Images() {
@@ -202,7 +202,7 @@ function Workflows() {
 
   const q = useQuery({
     queryKey: ['workflows'],
-    queryFn: () => api.get<{ items: Workflow[] }>('/workflows'),
+    queryFn: () => api.get<WorkflowList>('/workflows'),
   })
   const nodes = useQuery({ queryKey: ['comfy-nodes'], queryFn: () => api.get<{ items: ComfyNode[] }>('/comfy-nodes') })
 
@@ -223,18 +223,32 @@ function Workflows() {
   })
 
   async function openDetail(w: Workflow) {
-    const d = await api.get<{ comfy_workflow: string; param_slots: string }>(`/workflows/${w.id}`)
+    const d = await api.get<{ comfy_workflow: string }>(`/workflows/${w.id}`)
     setFull(JSON.parse(d.comfy_workflow || '{}'))
   }
 
   async function dryRun(w: Workflow, params: unknown) {
-    const r = await api.post<{ ok: boolean; error?: string; workflow?: unknown; used?: string[] }>(
-      `/workflows/${w.id}/dry-run`,
-      { params },
-    )
+    const r = await api.post<{
+      ok: boolean
+      error?: string
+      workflow?: unknown
+      used?: string[]
+      unresolved?: string[]
+    }>(`/workflows/${w.id}/dry-run`, { params })
+
+    // 未解析的占位符要顶在最前面说：它不会让试跑失败，但会让 ComfyUI
+    // 把 "{{negative_prompt}}" 这串字面量当成提示词用，图废了还不报错。
+    const unresolved = r.unresolved ?? []
+    const warn =
+      unresolved.length > 0
+        ? `⚠️ 未解析的占位符：${unresolved.join(', ')}\n` +
+          `   这些不在可传参数（prompt / size / seed）里，调用方也传不了。\n` +
+          `   请在模板里给它们加默认值，例如 {{negative_prompt|}}。\n\n`
+        : ''
+
     setDryOut(
       r.ok
-        ? `占位符填充结果（用到的参数：${(r.used ?? []).join(', ') || '无'}）\n\n${JSON.stringify(r.workflow, null, 2)}`
+        ? `${warn}占位符填充结果（用到的参数：${(r.used ?? []).join(', ') || '无'}）\n\n${JSON.stringify(r.workflow, null, 2)}`
         : `渲染失败：${r.error}`,
     )
   }
@@ -250,7 +264,7 @@ function Workflows() {
             onClick={() => {
               setEditing(null)
               form.resetFields()
-              form.setFieldsValue({ mode: 'template', enabled: true, archive: false, param_slots: [], node_ids: [] })
+              form.setFieldsValue({ mode: 'template', enabled: true, node_ids: [] })
               setOpen(true)
             }}
           >
@@ -262,13 +276,16 @@ function Workflows() {
           type="info"
           showIcon
           style={{ marginBottom: 16 }}
-          message="模板占位符语法"
+          message="调用方选的是模型，不是工作流"
           description={
             <span>
-              在 ComfyUI workflow JSON 里写 <code>{'{{prompt}}'}</code> 或{' '}
-              <code>{'{{width|1024}}'}</code>（管道后是默认值）。整串就是一个占位符时会保留 JSON 类型
-              —— <code>{'{{seed}}'}</code> 会变成数字 <code>42</code> 而不是字符串 <code>"42"</code>。
-              传了模板没消费的参数会直接报错，避免「设了 seed 却每次出图一样」这类问题被静默吞掉。
+              调用方在请求体顶层传 <code>model</code>，网关从模板里的 checkpoint
+              文件名推出这个值并用它选工作流（只认 UnetLoader / CheckpointLoader
+              这类主模型加载器，VAE 和 CLIP 不算）。<b>改 checkpoint 文件名就等于改
+              model</b>，现有调用方会立刻 404。只有一个启用的模型时不传也能用，多于一个
+              必须显式指定。可传参数只有 <code>prompt</code> / <code>size</code> /{' '}
+              <code>seed</code>，占位符写 <code>{'{{prompt}}'}</code> 或{' '}
+              <code>{'{{width|1024}}'}</code>（管道后是默认值）。
             </span>
           }
         />
@@ -281,7 +298,7 @@ function Workflows() {
             {
               title: '名称',
               dataIndex: 'name',
-              width: 150,
+              width: 210,
               render: (v, w) => (
                 <Space direction="vertical" size={0}>
                   <Space>
@@ -291,8 +308,26 @@ function Workflows() {
                     </Tag>
                     {!w.enabled && <Tag>已停用</Tag>}
                   </Space>
+                  <Space size={4} wrap>
+                    {/* 调用方传的是 model，不是这个名字 */}
+                    {w.mode === 'raw' ? (
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        raw 通道不按模型选
+                      </Typography.Text>
+                    ) : w.model ? (
+                      <Tag color="gold" style={{ fontSize: 12 }}>
+                        model: {w.model}
+                      </Tag>
+                    ) : (
+                      <Tooltip title={w.model_error}>
+                        <Tag color="red" style={{ fontSize: 12 }}>
+                          推不出模型名
+                        </Tag>
+                      </Tooltip>
+                    )}
+                  </Space>
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    槽位：{(w.param_slots ?? []).join(', ') || '无'}
+                    可传参数：{(w.allowed_params ?? []).join(', ')}
                   </Typography.Text>
                 </Space>
               ),
@@ -307,11 +342,6 @@ function Workflows() {
               title: '单价',
               width: 100,
               render: (_, w) => <span>{money(w.price_micro)} 元/张</span>,
-            },
-            {
-              title: '归档',
-              width: 90,
-              render: (_, w) => (w.archive ? <Tag color="green">落盘</Tag> : <Tag>仅返回</Tag>),
             },
             {
               title: '操作',
@@ -344,11 +374,8 @@ function Workflows() {
                         name: w.name,
                         mode: w.mode,
                         node_ids: w.node_ids,
-                        param_slots: w.param_slots,
                         price_micro: w.price_micro,
                         enabled: w.enabled,
-                        archive: w.archive,
-                        archive_retention_days: w.archive_retention_days,
                         comfy_workflow: d.comfy_workflow,
                       })
                       setOpen(true)
@@ -446,34 +473,23 @@ function Workflows() {
             />
           </Form.Item>
           <Form.Item
-            name="param_slots"
-            label="允许的参���槽"
-            extra="只允许注入这里列出的参数名，调用方传别的会被拒绝"
-            rules={[{ required: true }]}
-          >
-            <Select mode="tags" placeholder="prompt / negative / seed / width" open={false} />
-          </Form.Item>
-          <Form.Item
             name="comfy_workflow"
             label="ComfyUI workflow（API 格式 JSON）"
-            extra='形如 {"1":{"class_type":"TextEncode","inputs":{"text":"{{prompt}}"}}}'
+            extra={
+              <>
+                形如{' '}
+                <code>{'{"1":{"class_type":"TextEncode","inputs":{"text":"{{prompt}}"}}}'}</code>
+                。可传参数固定为 <code>prompt / size / seed</code>，其中 <code>size</code> 只有 <code>3x4</code>（768×1024）与 <code>16x9</code>（1024×576）两组，由网关展开成模板里的宽高占位符；
+                别的值（反向提示词、步数…）要固定住就写成 <code>{'{{negative_prompt|}}'}</code>{' '}
+                这种带默认值的占位符，否则试跑会报「未解析」。
+              </>
+            }
           >
             <Input.TextArea rows={8} style={{ fontFamily: 'monospace' }} />
           </Form.Item>
           <Space size="large" wrap>
             <Form.Item name="enabled" label="启用" valuePropName="checked">
               <Switch />
-            </Form.Item>
-            <Form.Item
-              name="archive"
-              label="图片落盘归档"
-              valuePropName="checked"
-              extra="关掉就只在响应里返回 base64，不占磁盘"
-            >
-              <Switch />
-            </Form.Item>
-            <Form.Item name="archive_retention_days" label="归档保留天数">
-              <InputNumber min={1} max={3650} placeholder="留空=永久" />
             </Form.Item>
           </Space>
         </Form>

@@ -1,6 +1,9 @@
 //! 调用明细与每日汇总。
 //!
 //! **只存元数据，不存 prompt / completion 正文**——这是产品决策而非未完成项。
+//! 唯一的例外是**出图**：`image_prompt` 表单独记下出图提示词（见
+//! `api::images::record_prompt`），因为出图没有 completion 正文，
+//! 而「这张图是哪句话生成的」是唯一能追回结果的线索。LLM 侧仍然一字不记。
 
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
@@ -166,8 +169,69 @@ pub async fn list(
     qb.push(" ORDER BY id DESC LIMIT ").push_bind(limit);
     qb.push(" OFFSET ").push_bind(offset);
     let rows = qb.build().fetch_all(pool).await?;
-    let items = rows.iter().map(row_to_json).collect();
+    let mut items: Vec<Value> = rows.iter().map(row_to_json).collect();
+
+    // 回带出图提示词：单独一张表，按本页的 request_id 批量补一次，
+    // 不改主查询（主查询的 WHERE 条件与分页都要原样保持）。
+    attach_prompts(pool, &mut items).await;
+
     Ok((items, total))
+}
+
+/// 给本页明细补上 `prompt` 字段（仅出图行有）。
+///
+/// 一次 `IN` 查询搞定整页；查不到就保持字段缺席，前端据此判断「没记」而不是
+/// 「记了但是空」。
+async fn attach_prompts(pool: &SqlitePool, items: &mut [Value]) {
+    if items.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = items
+        .iter()
+        .filter_map(|v| {
+            v.get("request_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+
+    let rows = {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT request_id, prompt FROM image_prompt WHERE request_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in &ids {
+            sep.push_bind(id);
+        }
+        sep.push_unseparated(")");
+        qb.build().fetch_all(pool).await
+    };
+    let Ok(rows) = rows else { return };
+    if rows.is_empty() {
+        return;
+    }
+
+    let map: std::collections::HashMap<String, String> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("request_id"),
+                r.get::<String, _>("prompt"),
+            )
+        })
+        .collect();
+
+    for item in items.iter_mut() {
+        let Some(rid) = item.get("request_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(p) = map.get(rid) {
+            item["prompt"] = Value::String(p.clone());
+        }
+    }
 }
 
 fn row_to_json(r: &sqlx::sqlite::SqliteRow) -> Value {
@@ -244,6 +308,10 @@ pub async fn summary(
 }
 
 /// 清理超期的调用明细。`usage_daily` 永久保留。
+///
+/// 提示词跟随明细一起清：`image_prompt.request_id` 上挂了 `ON DELETE CASCADE`，
+/// 这里删完 `request_log` 它会跟着没，不用单独排期。留着不删的话，
+/// 提示词会变成一份永不过期的正文副本——那正是这张表当初要避免的。
 pub async fn purge_older_than(pool: &SqlitePool, days: i64) -> anyhow::Result<u64> {
     let cutoff = unix_now() - days * 24 * 3600;
     let r = sqlx::query("DELETE FROM request_log WHERE created_at < ?")
@@ -251,4 +319,153 @@ pub async fn purge_older_than(pool: &SqlitePool, days: i64) -> anyhow::Result<u6
         .execute(pool)
         .await?;
     Ok(r.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::ir::UnifiedUsage;
+
+    async fn test_pool() -> SqlitePool {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let path = dir.path().join("u.db");
+        let pool = crate::db::connect(&path).await.expect("建库");
+        crate::db::migrate::MIGRATOR
+            .run(&pool)
+            .await
+            .expect("跑迁移");
+        std::mem::forget(dir);
+        sqlx::query(
+            "INSERT INTO account (id, name, api_key_hash, api_key_prefix, created_at, updated_at)
+             VALUES (1,'self','h','sk-hac-',0,0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("插入账号");
+        pool
+    }
+
+    fn image_entry(request_id: &str) -> LogEntry {
+        LogEntry {
+            request_id: request_id.to_string(),
+            account_id: 1,
+            kind: "image",
+            protocol: None,
+            target: "txt2img".into(),
+            node_id: None,
+            node_name: None,
+            key_id: None,
+            rotated_count: 0,
+            stream: false,
+            status: "ok",
+            error_kind: None,
+            error_message: None,
+            queue_wait_ms: 0,
+            latency_ms: 1,
+            usage: UnifiedUsage::default(),
+            tokens_source: "none",
+            image_count: 1,
+            cost_micro: 100_000,
+            notes: Vec::new(),
+        }
+    }
+
+    async fn put_prompt(pool: &SqlitePool, request_id: &str, prompt: &str) {
+        sqlx::query(
+            "INSERT INTO image_prompt (request_id, account_id, workflow, prompt, created_at)
+             VALUES (?,1,'txt2img',?,?)",
+        )
+        .bind(request_id)
+        .bind(prompt)
+        .bind(unix_now())
+        .execute(pool)
+        .await
+        .expect("写入提示词");
+    }
+
+    /// 承重墙：明细列表要能把提示词带出来，否则「记了却看不到」等于没记。
+    #[tokio::test]
+    async fn list_carries_the_prompt_back() {
+        let pool = test_pool().await;
+        write(&pool, &image_entry("r-1")).await.unwrap();
+        put_prompt(&pool, "r-1", "一只猫").await;
+
+        let (items, _) = list(&pool, None, None, None, None, None, None, 50, 0)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["prompt"], Value::String("一只猫".into()));
+    }
+
+    /// LLM 明细**不该**凭空长出 prompt 字段：那张表不存正文。
+    #[tokio::test]
+    async fn llm_rows_have_no_prompt_field() {
+        let pool = test_pool().await;
+        let mut e = image_entry("r-2");
+        e.kind = "llm";
+        e.protocol = Some("chat");
+        write(&pool, &e).await.unwrap();
+
+        let (items, _) = list(&pool, None, None, None, None, None, None, 50, 0)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0].get("prompt").is_none(),
+            "LLM 行不该带 prompt 字段，实际 {:?}",
+            items[0].get("prompt")
+        );
+    }
+
+    /// 分页只回带本页的提示词，不能把别的页的串进来。
+    #[tokio::test]
+    async fn prompts_are_scoped_to_the_page() {
+        let pool = test_pool().await;
+        for i in 1..=3 {
+            write(&pool, &image_entry(&format!("r-{i}"))).await.unwrap();
+        }
+        put_prompt(&pool, "r-2", "只属于第二页").await;
+
+        let (items, _) = list(&pool, None, None, None, None, None, None, 1, 0)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["request_id"], Value::String("r-3".into()));
+        assert!(
+            items[0].get("prompt").is_none(),
+            "第一页是 r-3，不该带 r-2 的提示词"
+        );
+    }
+
+    /// 提示词必须跟着明细一起过期，否则它就是一份永不过期的正文副本。
+    #[tokio::test]
+    async fn purging_logs_takes_the_prompt_with_it() {
+        let pool = test_pool().await;
+        write(&pool, &image_entry("r-old")).await.unwrap();
+        put_prompt(&pool, "r-old", "会过期").await;
+
+        // 把明细的时间戳推到 100 天前，再用默认保留期清理
+        sqlx::query("UPDATE request_log SET created_at = ? WHERE request_id = ?")
+            .bind(unix_now() - 100 * 24 * 3600)
+            .bind("r-old")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // 提示词的时间戳也推前，确保不是靠它自己的时间被清的
+        sqlx::query("UPDATE image_prompt SET created_at = ? WHERE request_id = ?")
+            .bind(unix_now())
+            .bind("r-old")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        purge_older_than(&pool, 90).await.unwrap();
+
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM image_prompt WHERE request_id = 'r-old'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(left, 0, "明细被清了，提示词必须跟着级联删掉");
+    }
 }

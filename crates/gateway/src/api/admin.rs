@@ -165,7 +165,6 @@ pub async fn list_accounts(State(s): Shared, _a: AdminAuthed) -> ApiResult<Json<
                 "llm_max_queue": r.get::<i64, _>("llm_max_queue"),
                 "image_max_concurrency": r.get::<i64, _>("image_max_concurrency"),
                 "image_max_queue": r.get::<i64, _>("image_max_queue"),
-                "rpm_limit": r.get::<Option<i64>, _>("rpm_limit"),
                 "created_at": r.get::<i64, _>("created_at"),
             })
         })
@@ -183,7 +182,6 @@ pub struct AccountBody {
     pub llm_max_queue: Option<i64>,
     pub image_max_concurrency: Option<i64>,
     pub image_max_queue: Option<i64>,
-    pub rpm_limit: Option<Option<i64>>,
 }
 
 /// 建账号。明文 key **只在这一次响应里出现**，库里只存 SHA-256。
@@ -244,7 +242,7 @@ pub async fn update_account(
                 llm_max_queue = COALESCE(?, llm_max_queue),
                 image_max_concurrency = COALESCE(?, image_max_concurrency),
                 image_max_queue = COALESCE(?, image_max_queue),
-                rpm_limit = COALESCE(?, rpm_limit), updated_at = ?
+                updated_at = ?
          WHERE id = ?",
     )
     .bind(&b.name)
@@ -253,7 +251,6 @@ pub async fn update_account(
     .bind(b.llm_max_queue.map(|v| v.max(0)))
     .bind(b.image_max_concurrency.map(|v| v.clamp(1, 1024)))
     .bind(b.image_max_queue.map(|v| v.max(0)))
-    .bind(b.rpm_limit.flatten())
     .bind(now)
     .bind(id)
     .execute(&s.pool)
@@ -285,7 +282,6 @@ async fn load_account(s: &AppState, id: i64) -> ApiResult<Option<crate::domain::
         llm_max_queue: r.get("llm_max_queue"),
         image_max_concurrency: r.get("image_max_concurrency"),
         image_max_queue: r.get("image_max_queue"),
-        rpm_limit: r.get("rpm_limit"),
     }))
 }
 
@@ -452,9 +448,6 @@ pub struct NodeBody {
     pub disabled_timezone: Option<String>,
     pub extra_headers: Option<Value>,
     pub extra_body: Option<Value>,
-    /// 预留位：当前没有节点原生支持 `/v1/responses`，
-    /// 但把它记下来，将来接的时候不用改 schema。
-    pub capabilities: Option<Value>,
 }
 
 pub async fn create_node(State(s): Shared, _a: AdminAuthed, Json(b): Json<NodeBody>) -> ApiResult<Response> {
@@ -467,8 +460,8 @@ pub async fn create_node(State(s): Shared, _a: AdminAuthed, Json(b): Json<NodeBo
         "INSERT INTO llm_node (name, kind, base_url, lan_base_url, max_concurrency,
                                default_max_output_tokens, enabled, sort_order,
                                disabled_start, disabled_end, disabled_timezone,
-                               extra_headers, extra_body, capabilities, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                               extra_headers, extra_body, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&b.name)
     .bind(b.kind.as_deref().unwrap_or("openai"))
@@ -483,7 +476,6 @@ pub async fn create_node(State(s): Shared, _a: AdminAuthed, Json(b): Json<NodeBo
     .bind(b.disabled_timezone.as_deref())
     .bind(json_str(&b.extra_headers))
     .bind(json_str(&b.extra_body))
-    .bind(json_str(&b.capabilities))
     .bind(now)
     .bind(now)
     .execute(&s.pool)
@@ -1056,27 +1048,35 @@ pub async fn list_workflows(State(s): Shared, _a: AdminAuthed) -> ApiResult<Json
     let items: Vec<Value> = rows
         .iter()
         .map(|r| {
+            let comfy: Value = serde_json::from_str(&r.get::<String, _>("comfy_workflow"))
+                .unwrap_or(Value::Object(Default::default()));
+            // 模型名是**推**出来的，前端要能看见推导结果——改 checkpoint
+            // 等于改 model id，只藏在内核里的话没人会发现调用方会 404。
+            let (model, model_err) = match crate::domain::workflow::derive_model(&comfy) {
+                Ok(m) => (m, String::new()),
+                Err(e) => (String::new(), e),
+            };
             json!({
                 "id": r.get::<i64, _>("id"),
                 "name": r.get::<String, _>("name"),
                 "mode": r.get::<String, _>("mode"),
+                "model": model,
+                "model_error": model_err,
                 "node_ids": serde_json::from_str::<Vec<i64>>(&r.get::<String, _>("node_ids"))
-                    .unwrap_or_default(),
-                "param_slots": serde_json::from_str::<Vec<String>>(&r.get::<String, _>("param_slots"))
                     .unwrap_or_default(),
                 "price_micro": r.get::<i64, _>("price_micro"),
                 "enabled": r.get::<i64, _>("enabled") != 0,
-                "archive": r.get::<i64, _>("archive") != 0,
-                "archive_retention_days": r.get::<Option<i64>, _>("archive_retention_days"),
-                "has_workflow_json": r
-                    .get::<String, _>("comfy_workflow")
-                    .chars()
-                    .count()
-                    > 2,
+                // 参数面是全局固定的，列表里直接告诉前端能传什么
+                "allowed_params": crate::domain::workflow::allowed_slots_json(),
+                "sizes": crate::domain::workflow::size_presets_json(),
+                "has_workflow_json": comfy != Value::Object(Default::default()),
             })
         })
         .collect();
-    Ok(Json(json!({ "items": items })))
+    Ok(Json(json!({
+        "items": items,
+        "default_size": crate::domain::workflow::DEFAULT_SIZE,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -1086,13 +1086,9 @@ pub struct WorkflowBody {
     pub mode: Option<String>,
     pub node_ids: Option<Vec<i64>>,
     pub comfy_workflow: Option<String>,
-    pub param_slots: Option<Vec<String>>,
     pub price_micro: Option<i64>,
     #[serde(default)]
     pub enabled: Option<bool>,
-    #[serde(default)]
-    pub archive: Option<bool>,
-    pub archive_retention_days: Option<i64>,
 }
 
 pub async fn create_workflow(
@@ -1105,20 +1101,16 @@ pub async fn create_workflow(
         return Err(ApiError::bad_request("单价不能为负"));
     }
     let id = sqlx::query(
-        "INSERT INTO workflow (name, mode, node_ids, comfy_workflow, param_slots,
-                               price_micro, enabled, archive, archive_retention_days,
-                               created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO workflow (name, mode, node_ids, comfy_workflow,
+                               price_micro, enabled, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?)",
     )
     .bind(&b.name)
     .bind(b.mode.as_deref().unwrap_or("template"))
     .bind(serde_json::to_string(&b.node_ids.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".into()))
     .bind(b.comfy_workflow.clone().unwrap_or_else(|| "{}".into()))
-    .bind(serde_json::to_string(&b.param_slots.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".into()))
     .bind(b.price_micro.unwrap_or(0))
     .bind(b.enabled.unwrap_or(true) as i64)
-    .bind(b.archive.unwrap_or(false) as i64)
-    .bind(b.archive_retention_days)
     .bind(now())
     .bind(now())
     .execute(&s.pool)
@@ -1144,11 +1136,9 @@ pub async fn get_workflow(
         "mode": r.get::<String, _>("mode"),
         "node_ids": r.get::<String, _>("node_ids"),
         "comfy_workflow": r.get::<String, _>("comfy_workflow"),
-        "param_slots": r.get::<String, _>("param_slots"),
         "price_micro": r.get::<i64, _>("price_micro"),
         "enabled": r.get::<i64, _>("enabled") != 0,
-        "archive": r.get::<i64, _>("archive") != 0,
-        "archive_retention_days": r.get::<Option<i64>, _>("archive_retention_days"),
+        "allowed_params": crate::domain::workflow::allowed_slots_json(),
     })))
 }
 
@@ -1164,21 +1154,17 @@ pub async fn update_workflow(
     }
     let res = sqlx::query(
         "UPDATE workflow SET name=?, mode=COALESCE(?, mode), node_ids=COALESCE(?, node_ids),
-                comfy_workflow=COALESCE(?, comfy_workflow), param_slots=COALESCE(?, param_slots),
+                comfy_workflow=COALESCE(?, comfy_workflow),
                 price_micro=COALESCE(?, price_micro), enabled=COALESCE(?, enabled),
-                archive=COALESCE(?, archive),
-                archive_retention_days=COALESCE(?, archive_retention_days), updated_at=?
+                updated_at=?
          WHERE id = ?",
     )
     .bind(&b.name)
     .bind(b.mode.as_deref())
     .bind(b.node_ids.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())))
     .bind(b.comfy_workflow.as_deref())
-    .bind(b.param_slots.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())))
     .bind(b.price_micro)
     .bind(b.enabled.map(|v| v as i64))
-    .bind(b.archive.map(|v| v as i64))
-    .bind(b.archive_retention_days)
     .bind(now())
     .bind(id)
     .execute(&s.pool)
@@ -1216,35 +1202,30 @@ pub async fn dry_run_workflow(
     Path(id): Path<i64>,
     Json(b): Json<DryRunBody>,
 ) -> ApiResult<Json<Value>> {
-    let r = sqlx::query("SELECT comfy_workflow, param_slots FROM workflow WHERE id = ?")
+    let r = sqlx::query("SELECT comfy_workflow FROM workflow WHERE id = ?")
         .bind(id)
         .fetch_optional(&s.pool)
         .await?
         .ok_or_else(|| ApiError::not_found("工作流不存在"))?;
     let tpl: Value = serde_json::from_str(&r.get::<String, _>("comfy_workflow"))
         .map_err(|e| ApiError::bad_request(format!("工作流 JSON 解析失败：{e}")))?;
-    // 槽位过滤要和真实提交路径**用同一套规则**，否则试跑通过、
+    // 参数校验与 size 展开要和真实提交路径**走同一个函数**，否则试跑通过、
     // 实际调用却被拒，排障时会怀疑是别的地方坏了。
     let params = b.params.as_object().cloned().unwrap_or_default();
-    let declared: std::collections::HashSet<String> =
-        serde_json::from_str::<Vec<String>>(&r.get::<String, _>("param_slots"))
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-    let unknown: Vec<&str> = params
-        .keys()
-        .map(String::as_str)
-        .filter(|k| !declared.contains(*k))
-        .collect();
-    if !unknown.is_empty() {
-        return Ok(Json(json!({
-            "ok": false,
-            "error": format!("工作流没有这些参数槽：{}", unknown.join(", ")),
-        })));
-    }
+    let slots = match crate::upstream::workflow::prepare_slots(&tpl, &params) {
+        Ok(s) => s,
+        Err(e) => return Ok(Json(json!({ "ok": false, "error": e.0 }))),
+    };
 
-    match crate::upstream::workflow::render(&tpl, &params) {
-        Ok((v, used)) => Ok(Json(json!({ "ok": true, "used": used, "workflow": v }))),
+    match crate::upstream::workflow::render(&tpl, &slots) {
+        Ok((v, used, unresolved)) => Ok(Json(json!({
+            "ok": true,
+            "used": used,
+            // 调用方只能传固定那几个，所以模板里剩下的占位符永远填不上。
+            // 不报出来的话，`TextEncode` 会把那串字面量当提示词用，图废了还不报错。
+            "unresolved": unresolved,
+            "workflow": v,
+        }))),
         Err(e) => Ok(Json(json!({ "ok": false, "error": e.0 }))),
     }
 }
@@ -1483,7 +1464,7 @@ pub async fn backup_retention(State(s): Shared, _a: AdminAuthed) -> ApiResult<Js
 
 // ── 内部工具 ────────────────────────────────────────────────────────────────
 
-/// `extra_headers` / `extra_body` / `capabilities` 在 schema 里是
+/// `extra_headers` / `extra_body` 在 schema 里是
 /// `NOT NULL DEFAULT '{}'`，绑 NULL 会直接触发约束失败。
 /// 读路径本来就容忍非法 JSON（回退空对象），所以这里给 "{}" 即可。
 fn json_str(v: &Option<Value>) -> String {
