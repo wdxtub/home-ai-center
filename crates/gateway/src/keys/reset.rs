@@ -229,10 +229,12 @@ mod tests {
 
     #[test]
     fn natural_date_is_read_as_utc_midnight() {
-        let msg = "You will regain access on 2026-10-01 at 00:00 UTC.";
-        let at = parse_natural_date(msg).unwrap();
+        // 日期相对「现在」构造，理由见 super::super::future_utc_date。
+        let expected = super::super::future_utc_date(2);
+        let msg = format!("You will regain access on {expected} at 00:00 UTC.");
+        let at = parse_natural_date(&msg).unwrap();
         let dt = chrono::DateTime::from_timestamp(at, 0).unwrap();
-        assert_eq!((dt.year(), dt.month(), dt.day()), (2026, 10, 1));
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), expected);
         assert_eq!(dt.hour(), 0);
     }
 

@@ -292,10 +292,12 @@ mod tests {
     // ── #1 ──
     #[test]
     fn r1_anthropic_spend_limit() {
+        // 恢复日期相对「现在」构造，理由见 super::super::future_utc_date。
+        let day = super::super::future_utc_date(2);
         let v = verdict(
             429,
             json!({"type":"error","error":{"type":"rate_limit_error",
-                "message":"You have reached your API usage limits: your organization has crossed its monthly API usage threshold. You will regain access on 2026-10-01 at 00:00 UTC.",
+                "message":format!("You have reached your API usage limits: your organization has crossed its monthly API usage threshold. You will regain access on {day} at 00:00 UTC."),
                 "details":{"error_code":"enforced_spend_limit_reached"}}}),
             None,
         );
@@ -321,11 +323,13 @@ mod tests {
     /// 只按 429 判定的检测器会整类漏掉，而它 100% 可换 key 重试。
     #[test]
     fn r3_specified_spend_limit_detected_on_400_not_429() {
+        let day = super::super::future_utc_date(2);
         let body = json!({"type":"error","error":{"type":"invalid_request_error",
-            "message":"You have reached your specified API usage limits. You will regain access on 2026-10-01 at 00:00 UTC."}});
+            "message":format!("You have reached your specified API usage limits. You will regain access on {day} at 00:00 UTC.")}});
         let v = verdict(400, body.clone(), None);
         assert_eq!(v.class, QuotaClass::LongQuota, "400 的 spend limit 必须被识别");
         assert_eq!(v.rule, "R3_anthropic_specified_spend_limit");
+        assert!(v.reset_at.is_some(), "恢复时间同样要能从消息里解析出来");
 
         // 429 也要认
         let v2 = verdict(429, body, None);

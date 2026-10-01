@@ -2,6 +2,8 @@
 /data
 /web/dist
 /web/node_modules
+.env
+.env.*
 *.db
 *.db-wal
 *.db-shm

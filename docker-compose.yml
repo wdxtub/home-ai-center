@@ -16,7 +16,7 @@ services:
       HOME_AI_TIMEZONE: "${HOME_AI_TIMEZONE:-Asia/Shanghai}"
       # 每日备份时刻（本地时间）
       HOME_AI_BACKUP_AT: "${HOME_AI_BACKUP_AT:-03:30}"
-      # 节点健康复检间隔（秒）
+      # 节点健康复检间隔（分钟，下限 10）
       HOME_AI_PROBE_INTERVAL: "${HOME_AI_PROBE_INTERVAL:-15}"
       # 单次请求排队等待上限（秒）
       HOME_AI_QUEUE_TIMEOUT: "${HOME_AI_QUEUE_TIMEOUT:-120}"

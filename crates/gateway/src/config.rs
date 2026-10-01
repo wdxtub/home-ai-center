@@ -19,7 +19,8 @@ pub struct Config {
     pub backup_at: String,
     /// 时区名，用于备份调度与「每日」统计的分桶。
     pub timezone: String,
-    /// 节点健康复检间隔（秒）。
+    /// 节点健康复检间隔（**分钟**）。`tasks/probe.rs` 内部会 `* 60` 换成秒，
+    /// 且下限为 10 —— 字段名里的 `_secs` 是历史遗留，别按秒理解。
     pub probe_interval_secs: u64,
     /// 单次排队等待上限（秒）。
     pub queue_timeout_secs: u64,

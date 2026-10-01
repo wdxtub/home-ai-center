@@ -31,6 +31,22 @@ pub const MAX_RESET_HORIZON: Duration = Duration::from_secs(8 * 24 * 3600);
 /// `Retry-After` 的上限（上游可能返回荒谬值）。
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
+/// 造一个「将来某日 00:00 UTC」的 `%Y-%m-%d` 串，供测试拼自然语言日期用。
+///
+/// **不要在测试里写死绝对日期。** `parse_natural_date` 的结果要过
+/// [`reset::clamp_reset`]，而 `clamp_reset` 会拒绝已经过去的时刻——
+/// 这是生产上正确的行为。写死 `2026-10-01` 这种日期，测试就能在那天
+/// 零点过后必然失败（已经踩过一次：当天 00:36 挂了两项）。
+///
+/// 取 2 天后的零点：无论当前时刻离午夜多近，都至少还剩 1 天余量，
+/// 同时稳稳落在 8 天合理区间内。
+#[cfg(test)]
+pub(crate) fn future_utc_date(days: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
 /// 每把 key 的运行时态。**冷却截止时刻同时落库**——
 /// 5 小时冷却若因容器重启丢失，重启后会立刻再撞一次限额。
 #[derive(Debug, Clone)]
@@ -363,7 +379,6 @@ mod tests {
             window_tokens_used: 0,
             count_429: 0,
             count_rotations: 0,
-            count_false_positive: 0,
             last_used_at: None,
             soft_cap_reached: false,
         }
@@ -430,10 +445,15 @@ mod tests {
         };
         ring.apply_verdict(&n.keys[0], &verdict, None).await;
 
-        assert!(!ring.node_has_usable_key(&n).await || true);
+        // 还有 B 活着：一把 key 冷却不应让整个节点被判为无可用
+        assert!(
+            ring.node_has_usable_key(&n).await,
+            "B 仍可用，节点不应被判定为无可用 key"
+        );
         // B 仍可用
         let picked = ring.pick(&n).await.expect("B 应该还能用");
         assert_eq!(picked.id, 2);
+        // 只剩被冷却的那把时，才是真的没有可用 key
         assert!(!ring.node_has_usable_key(&node(vec![key(1, "A")])).await);
     }
 

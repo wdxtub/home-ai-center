@@ -87,7 +87,6 @@ mod tests {
             window_tokens_used: 0,
             count_429: 0,
             count_rotations: 0,
-            count_false_positive: 0,
             last_used_at: None,
             soft_cap_reached: false,
         }
