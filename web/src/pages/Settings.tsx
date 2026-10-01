@@ -14,10 +14,48 @@ export default function Settings() {
       items={[
         { key: 'pricing', label: '定价', children: <Pricing /> },
         { key: 'routes', label: '模型路由', children: <Routes /> },
+        { key: 'retention', label: '数据保留', children: <Retention /> },
         { key: 'backup', label: '备份', children: <Backup /> },
         { key: 'account', label: '管理员', children: <Admin /> },
       ]}
     />
+  )
+}
+
+/** 调用明细与出图提示词的保留期。
+ *
+ * 这项以前只能裸调 `PUT /settings` 改，界面上没有入口。调小了立刻见效，
+ * 调大了就是悄悄攒账，所以要能看见当前值、也要能改。
+ */
+function Retention() {
+  const qc = useQueryClient()
+  const { message } = App.useApp()
+  const q = useQuery({ queryKey: ['settings'], queryFn: () => api.get<Record<string, unknown>>('/settings') })
+
+  const days = typeof q.data?.log_retention_days === 'number' ? (q.data.log_retention_days as number) : 90
+
+  const save = useMutation({
+    mutationFn: (v: number) => api.put('/settings', { log_retention_days: v }),
+    onSuccess: () => {
+      message.success('已保存，下一次清理任务生效')
+      void qc.invalidateQueries({ queryKey: ['settings'] })
+    },
+    onError: (e: Error) => message.error(e.message),
+  })
+
+  return (
+    <Card size="small" title="调用明细保留期" style={{ maxWidth: 520 }}>
+      <Space direction="vertical" size={12} style={{ width: '100%' }}>
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          超过这个天数的调用明细会被清掉，**出图提示词跟着一起清**
+          （它在明细表上有级联删除）。每日汇总 usage_daily 永久保留，不受影响。
+        </Typography.Text>
+        <Space>
+          <InputNumber min={1} max={3650} value={days} onChange={(v) => v && save.mutate(v)} />
+          <Typography.Text type="secondary">天（当前 {days} 天）</Typography.Text>
+        </Space>
+      </Space>
+    </Card>
   )
 }
 

@@ -34,11 +34,35 @@ const NAV = [
 
 export default function App() {
   const [authed, setAuthed] = useState<boolean | null>(null)
+  const [who, setWho] = useState<string>('')
   const loc = useLocation()
   const nav = useNavigate()
 
   useEffect(() => {
-    setAuthed(!!getToken())
+    // 令牌存在 sessionStorage，刷新页面后仍然在——但它可能已经过期。
+    // 光看「有没有令牌」就放行的话，会渲染出满屏 401 的空壳界面，
+    // 所以这里拿它去问一次服务端。
+    if (!getToken()) {
+      setAuthed(false)
+      return
+    }
+    let cancelled = false
+    void api
+      .get<{ username: string }>('/auth/me')
+      .then((r) => {
+        if (cancelled) return
+        setWho(r.username)
+        setAuthed(true)
+      })
+      .catch(() => {
+        if (cancelled) return
+        // 过期 / 被登出：清掉残留令牌，退回登录页
+        setToken(null)
+        setAuthed(false)
+      })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   async function logout() {
@@ -95,7 +119,7 @@ export default function App() {
           }}
         >
           <Button type="text" icon={<LogoutOutlined />} onClick={logout}>
-            退出
+            退出{who ? `（${who}）` : ''}
           </Button>
         </Layout.Header>
         <Layout.Content style={{ padding: 20, overflow: 'auto' }}>
