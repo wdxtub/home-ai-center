@@ -10,6 +10,10 @@
 - **预付费余额 + 并发额度**，账目精确到 token
 - **每日自动备份**，滚动 7 天
 
+> 更详细的文档在 **[Docs/](Docs/README.md)**：API 参考、架构与请求生命周期、
+> 数据模型、备份恢复与升级 runbook、安全模型、排障手册。
+> 本文是入口和设计决策的权威口径，`Docs/` 是往下钻的细节。
+
 ---
 
 ## 快速开始
@@ -22,7 +26,8 @@ docker compose up -d
 
 打开 <http://localhost:8080>，用 `admin` + `.env` 里的口令登录。
 
-**先配单价再调模型**：没配单价的模型会被直接拒绝（402），这是刻意的。
+**先配单价再调模型**：没配单价的模型会被直接拒绝（400），这是刻意的。
+余额不足才是 402。
 
 ---
 
@@ -35,7 +40,7 @@ docker compose up -d
 填名称、上游地址、最大并发。
 
 > **上游地址要填到「端点前缀」，和 OpenAI SDK 的 `base_url` 一个意思**：
-> 网关只在其后拼 `/chat/completions`。所以 LM Studio 填 `http://n1-lms.wdxmzy.com:7001/v1`，
+> 网关只在其后拼 `/chat/completions`。所以 LM Studio 填 `http://192.168.1.20:7001/v1`，
 > **带 `/v1`**；只填到端口会变成 `POST /chat/completions`。
 >
 > 这个坑不好察觉：LM Studio 对错误路径回的是 **200 + `{"error":"Unexpected endpoint..."}`**，
@@ -166,7 +171,7 @@ client = OpenAI(base_url="http://localhost:8080/v1", api_key="sk-hac-xxx")
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/images/generations` | 出图 |
 | `GET /v1/models` | 可用模型 |
-| `GET /v1/workflows` | 可用工作流 |
+| `GET /v1/workflows` | 可用出图模型（由工作流推导出的 model） |
 | `GET /v1/usage` | 自己的余额与今日用量 |
 | `GET /api/health` | 健康检查（免鉴权） |
 
@@ -315,12 +320,14 @@ Chat 末块 `choices` 是空数组，跟着协议走账就错了。
 | --- | --- | --- |
 | `HOME_AI_DATA_DIR` | `./data` | 数据目录：SQLite、备份 |
 | `HOME_AI_BIND` | `0.0.0.0:8080` | 监听地址 |
+| `HOME_AI_CORS_ORIGINS` | — | 允许跨域的源，逗号分隔。**留空 = 只允许同源**（内置前端与 `npm run dev` 的代理都是同源，不用配）。放开后被列出的站点能带着调用方 key 跨域打 `/v1` 并读响应 |
 | `HOME_AI_ADMIN_TOKEN` | — | **首次启动**用于初始化管理员口令（用户名 `admin`） |
 | `HOME_AI_TIMEZONE` | `Asia/Shanghai` | 禁用时段与每日分桶用的时区 |
 | `HOME_AI_BACKUP_AT` | `03:30` | 每日备份时刻（本地时间） |
 | `HOME_AI_PROBE_INTERVAL` | `15` | 节点健康复检间隔（分钟） |
 | `HOME_AI_QUEUE_TIMEOUT` | `120` | 单次请求排队等待上限（秒） |
 | `HOME_AI_MAX_KEY_ROTATION` | `3` | 单个请求内最多轮换几把 key |
+| `HOME_AI_BACKGROUND_JOBS` | `4` | ⚠️ 目前**只用于启动日志**，不限制后台任务并发（三个任务是各自独立 `tokio::spawn`）。配了不生效 |
 | `HOME_AI_LOG` | `info,hac=debug,sqlx=warn` | 日志过滤 |
 
 改 `HOME_AI_ADMIN_TOKEN` 不会改已存的口令（初始化只跑一次），要改口令到「设置 → 管理员」。
@@ -332,7 +339,9 @@ Chat 末块 `choices` 是空数组，跟着协议走账就错了。
 ```
 /data
 ├── home-ai-center.db        # 全部配置与数据
-└── backups/                 # 每日备份，滚动 7 天
+├── home-ai-center.db-wal    # WAL，运行中必然存在
+├── home-ai-center.db-shm
+└── backups/                 # 每日备份，滚动 7 天（当前不可配置）
     └── hac-20260115-033000.db
 ```
 
@@ -350,18 +359,21 @@ Chat 末块 `choices` 是空数组，跟着协议走账就错了。
 提示词和明细分开存只是为了让 `request_log` 保持「不存正文」的定位，
 不是给它开一条永不过期的后门。
 
-保留期在管理台「设置 → 数据保留」里改。数据目录里那个旧的 `images/`
-是归档时代的遗留：空的会被启动时清掉，里面还有文件的只会告警、
-需要你手动删 —— 网关不会替你删可能是唯一一份的图。
+明细保留期在管理台「设置 → 数据保留」里改。**备份的 7 天滚动是写死的**，
+当前没有环境变量也没有管理台开关（`tasks/backup.rs` 与管理台都传字面量 `7`）。
+数据目录里那个旧的 `images/` 是归档时代的遗留：空的会被启动时清掉，
+里面还有文件的只会告警、需要你手动删 —— 网关不会替你删可能是唯一一份的图。
 
 ---
 
 ## 本地开发
 
+> 完整的开发约定、验证命令与迁移硬约束见 **[Docs/contributing.md](Docs/contributing.md)**。
+
 ```bash
 # 后端
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p home-ai-center --lib      # 195 项
+cargo test -p home-ai-center --lib      # 258 项
 cargo run -p home-ai-center
 
 # 前端（另开一个终端）
@@ -431,6 +443,6 @@ python3 scripts/audit_sql.py
 - **记录 LLM 的 prompt / completion 正文**。产品决策：正文最占空间，而排查问题需要的
   「谁、何时、调了哪个模型、多少钱」都在明细里。**出图是唯一的例外**，见「出图」。
 - **在网关留图片**。图片由调用方自己保存，网关只在响应里回 base64。
-- **让调用方自由指定出图参数**。模板模式只接受 `prompt` / `width` / `height` / `seed`，
+- **让调用方自由指定出图参数**。模板模式只接受 `prompt` / `size` / `seed`，
   其余固定在模板里；`raw` 模式是另一条通道，本来就是整份 workflow 自行提交。
 - **自动探测后端参数**。关思考的参数各家不统一，逐节点配比猜更可靠。

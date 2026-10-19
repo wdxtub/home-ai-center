@@ -6,7 +6,7 @@
 //! 鉴权走 [`AdminAuthed`]：口令换来的会话 token，放在 `HttpOnly` Cookie 里。
 //! 网关面（API Key）与管理面是两套凭证，互不通用。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -40,18 +40,62 @@ pub struct LoginBody {
     pub password: String,
 }
 
-pub async fn login(State(s): Shared, Json(b): Json<LoginBody>) -> ApiResult<Response> {
+/// 请求是否经过 HTTPS。
+///
+/// 仓库不做 TLS 终止，所以正常部署下这个恒为 false——**这正是问题**：
+/// 套了 Nginx/Caddy 之后网关自己并不知道会话走在加密链路上，
+/// 于是 Cookie 少了 `Secure`，被降级到 http 时照样发。
+/// 采信 `x-forwarded-proto` 在这里是安全的：伪造它只能让 Cookie
+/// 变得更严（浏览器不再走 http），不可能更松。
+fn request_is_https(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+}
+
+pub async fn login(
+    State(s): Shared,
+    // `Option<Extension<…>>` 而不是 `Option<ConnectInfo<…>>`：axum 0.8
+    // 没给 `ConnectInfo` 实现 `OptionalFromRequestParts`，少了扩展就得
+    // 直接报错——单测里没有 connect info 时登录会整个挂掉。
+    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
+    headers: axum::http::HeaderMap,
+    Json(b): Json<LoginBody>,
+) -> ApiResult<Response> {
+    // 认不出对端就退化成单一来源：宁可所有人都被一起限流，
+    // 也不能因为拿不到 IP 就完全不限流。
+    let who = match peer {
+        Some(Extension(ConnectInfo(addr))) => addr.ip().to_string(),
+        None => "unknown".to_string(),
+    };
+
+    if let Some(secs) = s.login_throttle.blocked_for(&who) {
+        return Err(
+            ApiError::too_many_requests(format!("登录尝试过于频繁，{secs} 秒后再试"))
+                .with_retry_after(secs),
+        );
+    }
+
     let row = sqlx::query("SELECT * FROM admin_user WHERE username = ?")
         .bind(&b.username)
         .fetch_optional(&s.pool)
-        .await?
-        .ok_or_else(|| ApiError::unauthorized("用户名或口令不对"))?;
+        .await?;
+
+    let Some(row) = row else {
+        s.login_throttle.fail(&who);
+        return Err(ApiError::unauthorized("用户名或口令不对"));
+    };
 
     let hash: String = row.get("password_hash");
     // 口令不对也要走完校验再返回，避免用响应时间探测用户名
     if !auth::verify_password(&b.password, &hash) {
+        s.login_throttle.fail(&who);
         return Err(ApiError::unauthorized("用户名或口令不对"));
     }
+    s.login_throttle.succeed(&who);
 
     let token = auth::new_session_token();
     let expires = now() + 7 * 24 * 3600;
@@ -62,8 +106,14 @@ pub async fn login(State(s): Shared, Json(b): Json<LoginBody>) -> ApiResult<Resp
         .execute(&s.pool)
         .await?;
 
+    // https 才加 Secure。见 `request_is_https`。
+    let secure = if request_is_https(&headers) {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
-        "hac_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        "hac_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{secure}",
         7 * 24 * 3600
     );
     Ok(Response::builder()
@@ -76,12 +126,30 @@ pub async fn login(State(s): Shared, Json(b): Json<LoginBody>) -> ApiResult<Resp
         .unwrap())
 }
 
-pub async fn logout(State(s): Shared, _a: AdminAuthed) -> ApiResult<Response> {
-    if let Some(t) = current_token(&s).await {
-        sqlx::query("DELETE FROM session WHERE token = ?")
-            .bind(t)
-            .execute(&s.pool)
-            .await?;
+/// 登出删的就是这一行。
+///
+/// 单独抽出来是为了能直接测。原来这里传的是 `Some(String::new())`，
+/// 于是执行的是 `DELETE … WHERE token = ''`——一行都删不掉，而浏览器
+/// 那边的 Cookie 已经清了，「已登出」的凭证还能继续用满 7 天。
+async fn delete_session(pool: &sqlx::SqlitePool, token: &str) -> anyhow::Result<u64> {
+    Ok(sqlx::query("DELETE FROM session WHERE token = ?")
+        .bind(token)
+        .execute(pool)
+        .await?
+        .rows_affected())
+}
+
+/// 登出。
+///
+/// 关键是**真的把 `session` 里那一行删掉**：只清浏览器 Cookie 的话，
+/// 那把 token 仍然有效到过期为止，而它登录时就随响应体一起回给了前端。
+pub async fn logout(
+    State(s): Shared,
+    headers: axum::http::HeaderMap,
+    _a: AdminAuthed,
+) -> ApiResult<Response> {
+    if let Some(t) = auth::session_token(&headers) {
+        delete_session(&s.pool, &t).await?;
     }
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -136,40 +204,42 @@ pub async fn change_password(
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn current_token(s: &AppState) -> Option<String> {
-    // 会话 token 已在守卫里验过，这里只需要拿到它做删除
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE expires_at > ?")
-        .bind(now())
-        .fetch_one(&s.pool)
-        .await
-        .unwrap_or(0);
-    (n > 0).then(|| String::new())
-}
-
 // ── 账号 ────────────────────────────────────────────────────────────────────
+//
+// 账号只管**钱**。key 和并发额度在下面的 `api_key` 区。
+// 一个账号可以有多把 key，余额是它们共用的。
 
 pub async fn list_accounts(State(s): Shared, _a: AdminAuthed) -> ApiResult<Json<Value>> {
-    let rows = sqlx::query("SELECT * FROM account ORDER BY id").fetch_all(&s.pool).await?;
+    let rows = sqlx::query("SELECT * FROM account ORDER BY id")
+        .fetch_all(&s.pool)
+        .await?;
     let items: Vec<Value> = rows
         .iter()
         .map(|r| {
             json!({
                 "id": r.get::<i64, _>("id"),
                 "name": r.get::<String, _>("name"),
-                "api_key_prefix": r.get::<String, _>("api_key_prefix"),
                 "enabled": r.get::<i64, _>("enabled") != 0,
                 "balance_micro": r.get::<i64, _>("balance_micro"),
                 "held_micro": r.get::<i64, _>("held_micro"),
                 "available_micro": r.get::<i64, _>("balance_micro") - r.get::<i64, _>("held_micro"),
-                "llm_max_concurrency": r.get::<i64, _>("llm_max_concurrency"),
-                "llm_max_queue": r.get::<i64, _>("llm_max_queue"),
-                "image_max_concurrency": r.get::<i64, _>("image_max_concurrency"),
-                "image_max_queue": r.get::<i64, _>("image_max_queue"),
                 "created_at": r.get::<i64, _>("created_at"),
             })
         })
         .collect();
-    Ok(Json(json!({ "items": items })))
+    // 列表里带上各自的 key，界面上不用再发一轮请求
+    let keys = load_keys(&s, None).await?;
+    Ok(Json(json!({
+        "items": items,
+        "keys": keys,
+        // 建账号时的默认额度，新建的那把「默认」key 就用这套值
+        "default_quota": {
+            "llm_max_concurrency": DEFAULT_LLM_CONCURRENCY,
+            "llm_max_queue": DEFAULT_LLM_QUEUE,
+            "image_max_concurrency": DEFAULT_IMAGE_CONCURRENCY,
+            "image_max_queue": DEFAULT_IMAGE_QUEUE,
+        }
+    })))
 }
 
 #[derive(Deserialize)]
@@ -178,6 +248,7 @@ pub struct AccountBody {
     #[serde(default)]
     pub enabled: Option<bool>,
     pub balance_micro: Option<i64>,
+    /// 建账号时给第一把 key 的额度；之后每把 key 各自独立。
     pub llm_max_concurrency: Option<i64>,
     pub llm_max_queue: Option<i64>,
     pub image_max_concurrency: Option<i64>,
@@ -185,6 +256,9 @@ pub struct AccountBody {
 }
 
 /// 建账号。明文 key **只在这一次响应里出现**，库里只存 SHA-256。
+///
+/// 必然同时建一把叫「默认」的 key：建出来却没有任何 key 的账号
+/// 是没法用的状态，与其让用户自己想起来补，不如当场给一把。
 pub async fn create_account(
     State(s): Shared,
     _a: AdminAuthed,
@@ -193,24 +267,17 @@ pub async fn create_account(
     validate::validate_name(&b.name)?;
     let raw = auth::generate_api_key();
     let now = now();
+    let mut tx = s.pool.begin().await?;
     let id = sqlx::query(
-        "INSERT INTO account (name, api_key_hash, api_key_prefix, enabled, balance_micro,
-                               llm_max_concurrency, llm_max_queue,
-                               image_max_concurrency, image_max_queue, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO account (name, enabled, balance_micro, held_micro, created_at, updated_at)
+         VALUES (?,?,?,0,?,?)",
     )
     .bind(&b.name)
-    .bind(auth::hash_key(&raw))
-    .bind(auth::key_prefix(&raw))
     .bind(b.enabled.unwrap_or(true) as i64)
     .bind(b.balance_micro.unwrap_or(0))
-    .bind(b.llm_max_concurrency.unwrap_or(2).clamp(1, 1024))
-    .bind(b.llm_max_queue.unwrap_or(8).max(0))
-    .bind(b.image_max_concurrency.unwrap_or(1).clamp(1, 1024))
-    .bind(b.image_max_queue.unwrap_or(4).max(0))
     .bind(now)
     .bind(now)
-    .execute(&s.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         if matches!(&e, sqlx::Error::Database(d) if d.is_unique_violation()) {
@@ -221,9 +288,29 @@ pub async fn create_account(
     })?
     .last_insert_rowid();
 
+    let key_id = insert_key(
+        &mut tx,
+        id,
+        "默认",
+        &raw,
+        b.llm_max_concurrency,
+        b.llm_max_queue,
+        b.image_max_concurrency,
+        b.image_max_queue,
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+
     Ok((
         created(),
-        Json(json!({ "id": id, "api_key": raw })),
+        Json(json!({
+            "id": id,
+            "key_id": key_id,
+            "key_name": "默认",
+            // 明文只此一次
+            "api_key": raw,
+        })),
     )
         .into_response())
 }
@@ -235,54 +322,31 @@ pub async fn update_account(
     Json(b): Json<AccountBody>,
 ) -> ApiResult<Json<Value>> {
     validate::validate_name(&b.name)?;
-    let now = now();
+    // 额度不在这里改：它在 key 上。传了也当没传，否则用户以为改了其实没改。
+    if b.llm_max_concurrency.is_some()
+        || b.llm_max_queue.is_some()
+        || b.image_max_concurrency.is_some()
+        || b.image_max_queue.is_some()
+    {
+        return Err(ApiError::bad_request(
+            "并发额度是每把 API Key 独立的，请在「API Key」里改",
+        ));
+    }
     let res = sqlx::query(
-        "UPDATE account SET name = ?, enabled = COALESCE(?, enabled),
-                llm_max_concurrency = COALESCE(?, llm_max_concurrency),
-                llm_max_queue = COALESCE(?, llm_max_queue),
-                image_max_concurrency = COALESCE(?, image_max_concurrency),
-                image_max_queue = COALESCE(?, image_max_queue),
-                updated_at = ?
+        "UPDATE account SET name = ?, enabled = COALESCE(?, enabled), updated_at = ?
          WHERE id = ?",
     )
     .bind(&b.name)
     .bind(b.enabled.map(|v| v as i64))
-    .bind(b.llm_max_concurrency.map(|v| v.clamp(1, 1024)))
-    .bind(b.llm_max_queue.map(|v| v.max(0)))
-    .bind(b.image_max_concurrency.map(|v| v.clamp(1, 1024)))
-    .bind(b.image_max_queue.map(|v| v.max(0)))
-    .bind(now)
+    .bind(now())
     .bind(id)
     .execute(&s.pool)
     .await?;
     if res.rows_affected() == 0 {
         return Err(ApiError::not_found("账号不存在"));
     }
-    // 并发额度变了要立刻唤醒排队者
-    if let Some(a) = load_account(&s, id).await? {
-        let g = s.account_gate(id).await;
-        g.nudge(a.llm_max_concurrency).await;
-    }
     s.reload().await.ok();
     Ok(Json(json!({ "ok": true })))
-}
-
-async fn load_account(s: &AppState, id: i64) -> ApiResult<Option<crate::domain::account::Account>> {
-    let r = sqlx::query("SELECT * FROM account WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&s.pool)
-        .await?;
-    Ok(r.map(|r| crate::domain::account::Account {
-        id: r.get("id"),
-        name: r.get("name"),
-        enabled: r.get::<i64, _>("enabled") != 0,
-        balance_micro: r.get("balance_micro"),
-        held_micro: r.get("held_micro"),
-        llm_max_concurrency: r.get("llm_max_concurrency"),
-        llm_max_queue: r.get("llm_max_queue"),
-        image_max_concurrency: r.get("image_max_concurrency"),
-        image_max_queue: r.get("image_max_queue"),
-    }))
 }
 
 pub async fn delete_account(
@@ -299,38 +363,297 @@ pub async fn delete_account(
     Ok(Json(json!({ "ok": true })))
 }
 
-#[derive(Deserialize)]
-pub struct RotateKeyBody {
-    #[serde(default)]
-    pub name: Option<String>,
+// ── API Key ─────────────────────────────────────────────────────────────────
+
+const DEFAULT_LLM_CONCURRENCY: i64 = 2;
+const DEFAULT_LLM_QUEUE: i64 = 8;
+const DEFAULT_IMAGE_CONCURRENCY: i64 = 1;
+const DEFAULT_IMAGE_QUEUE: i64 = 4;
+
+fn key_json(r: &sqlx::sqlite::SqliteRow) -> Value {
+    json!({
+        "id": r.get::<i64, _>("id"),
+        "account_id": r.get::<i64, _>("account_id"),
+        "name": r.get::<String, _>("name"),
+        // 只给前缀。明文永远不落库，界面上靠前缀认人。
+        "key_prefix": r.get::<String, _>("key_prefix"),
+        "enabled": r.get::<i64, _>("enabled") != 0,
+        "llm_max_concurrency": r.get::<i64, _>("llm_max_concurrency"),
+        "llm_max_queue": r.get::<i64, _>("llm_max_queue"),
+        "image_max_concurrency": r.get::<i64, _>("image_max_concurrency"),
+        "image_max_queue": r.get::<i64, _>("image_max_queue"),
+        "created_at": r.get::<i64, _>("created_at"),
+    })
 }
 
-/// 换 key：旧 key 立刻失效。调用方需要同步更新客户端配置。
-pub async fn rotate_account_key(
+/// `account_id = None` 时返回全部 key（账号列表页要用）。
+async fn load_keys(s: &AppState, account_id: Option<i64>) -> ApiResult<Vec<Value>> {
+    let rows = match account_id {
+        Some(a) => {
+            sqlx::query("SELECT * FROM api_key WHERE account_id = ? ORDER BY id")
+                .bind(a)
+                .fetch_all(&s.pool)
+                .await?
+        }
+        None => {
+            sqlx::query("SELECT * FROM api_key ORDER BY id")
+                .fetch_all(&s.pool)
+                .await?
+        }
+    };
+    Ok(rows.iter().map(key_json).collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_key(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    account_id: i64,
+    name: &str,
+    raw: &str,
+    llm_conc: Option<i64>,
+    llm_queue: Option<i64>,
+    img_conc: Option<i64>,
+    img_queue: Option<i64>,
+    now: i64,
+) -> ApiResult<i64> {
+    Ok(sqlx::query(
+        "INSERT INTO api_key (account_id, name, key_hash, key_prefix, enabled,
+                              llm_max_concurrency, llm_max_queue,
+                              image_max_concurrency, image_max_queue, created_at, updated_at)
+         VALUES (?,?,?,?,1,?,?,?,?,?,?)",
+    )
+    .bind(account_id)
+    .bind(name)
+    .bind(auth::hash_key(raw))
+    .bind(auth::key_prefix(raw))
+    .bind(llm_conc.unwrap_or(DEFAULT_LLM_CONCURRENCY).clamp(1, 1024))
+    .bind(llm_queue.unwrap_or(DEFAULT_LLM_QUEUE).max(0))
+    .bind(img_conc.unwrap_or(DEFAULT_IMAGE_CONCURRENCY).clamp(1, 1024))
+    .bind(img_queue.unwrap_or(DEFAULT_IMAGE_QUEUE).max(0))
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| {
+        if matches!(&e, sqlx::Error::Database(d) if d.is_unique_violation()) {
+            ApiError::bad_request("该账号下已有同名 key")
+        } else {
+            e.into()
+        }
+    })?
+    .last_insert_rowid())
+}
+
+#[derive(Deserialize)]
+pub struct ApiKeyBody {
+    pub name: String,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    pub llm_max_concurrency: Option<i64>,
+    pub llm_max_queue: Option<i64>,
+    pub image_max_concurrency: Option<i64>,
+    pub image_max_queue: Option<i64>,
+}
+
+/// 在账号下再建一把 key。明文同样只出现一次。
+pub async fn create_api_key(
+    State(s): Shared,
+    _a: AdminAuthed,
+    Path(account_id): Path<i64>,
+    Json(b): Json<ApiKeyBody>,
+) -> ApiResult<Response> {
+    validate::validate_name(&b.name)?;
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account WHERE id = ?")
+        .bind(account_id)
+        .fetch_one(&s.pool)
+        .await?;
+    if exists == 0 {
+        return Err(ApiError::not_found("账号不存在"));
+    }
+    let raw = auth::generate_api_key();
+    let mut tx = s.pool.begin().await?;
+    let id = insert_key(
+        &mut tx,
+        account_id,
+        &b.name,
+        &raw,
+        b.llm_max_concurrency,
+        b.llm_max_queue,
+        b.image_max_concurrency,
+        b.image_max_queue,
+        now(),
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok((created(), Json(json!({ "id": id, "api_key": raw }))).into_response())
+}
+
+pub async fn update_api_key(
     State(s): Shared,
     _a: AdminAuthed,
     Path(id): Path<i64>,
-    Json(b): Json<RotateKeyBody>,
+    Json(b): Json<ApiKeyBody>,
 ) -> ApiResult<Json<Value>> {
-    let raw = auth::generate_api_key();
-    let prefix = if let Some(n) = b.name.as_deref().filter(|n| !n.is_empty()) {
-        format!("{n}:{raw}")
-    } else {
-        raw
-    };
+    validate::validate_name(&b.name)?;
     let res = sqlx::query(
-        "UPDATE account SET api_key_hash = ?, api_key_prefix = ?, updated_at = ? WHERE id = ?",
+        "UPDATE api_key SET name = ?, enabled = COALESCE(?, enabled),
+                llm_max_concurrency = COALESCE(?, llm_max_concurrency),
+                llm_max_queue = COALESCE(?, llm_max_queue),
+                image_max_concurrency = COALESCE(?, image_max_concurrency),
+                image_max_queue = COALESCE(?, image_max_queue),
+                updated_at = ?
+         WHERE id = ?",
     )
-    .bind(auth::hash_key(&prefix))
-    .bind(auth::key_prefix(&prefix))
+    .bind(&b.name)
+    .bind(b.enabled.map(|v| v as i64))
+    .bind(b.llm_max_concurrency.map(|v| v.clamp(1, 1024)))
+    .bind(b.llm_max_queue.map(|v| v.max(0)))
+    .bind(b.image_max_concurrency.map(|v| v.clamp(1, 1024)))
+    .bind(b.image_max_queue.map(|v| v.max(0)))
     .bind(now())
     .bind(id)
     .execute(&s.pool)
     .await?;
     if res.rows_affected() == 0 {
-        return Err(ApiError::not_found("账号不存在"));
+        return Err(ApiError::not_found("key 不存在"));
     }
-    Ok(Json(json!({ "api_key": prefix })))
+    // 额度变了要立刻唤醒这把 key 的排队者，否则调大额度后
+    // 已在队列里排着的请求会一直等到超时。
+    if let Some(c) = key_llm_concurrency(&s, id).await? {
+        s.key_gate(id).await.nudge(c).await;
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn key_llm_concurrency(s: &AppState, id: i64) -> ApiResult<Option<i64>> {
+    Ok(
+        sqlx::query_scalar("SELECT llm_max_concurrency FROM api_key WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&s.pool)
+            .await?,
+    )
+}
+
+/// 轮换某一把 key：只有这把失效，账号下别的 key 不受影响。
+///
+/// 这是与旧行为的唯一区别 —— 以前账号只有一把 key，「轮换」等于换掉账号的全部凭据。
+pub async fn rotate_api_key(
+    State(s): Shared,
+    _a: AdminAuthed,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    let raw = auth::generate_api_key();
+    let res =
+        sqlx::query("UPDATE api_key SET key_hash = ?, key_prefix = ?, updated_at = ? WHERE id = ?")
+            .bind(auth::hash_key(&raw))
+            .bind(auth::key_prefix(&raw))
+            .bind(now())
+            .bind(id)
+            .execute(&s.pool)
+            .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found("key 不存在"));
+    }
+    Ok(Json(json!({ "api_key": raw })))
+}
+
+pub async fn delete_api_key(
+    State(s): Shared,
+    _a: AdminAuthed,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    // request_log 上是 ON DELETE SET NULL：删 key 不删别人的历史账，
+    // 那笔账照样是发生过的，只是查不出是哪把 key 发的。
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account")
+        .fetch_one(&s.pool)
+        .await?;
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM api_key WHERE account_id =
+           (SELECT account_id FROM api_key WHERE id = ?)",
+    )
+    .bind(id)
+    .fetch_one(&s.pool)
+    .await
+    .unwrap_or(0);
+    if remaining <= 1 {
+        return Err(ApiError::bad_request(format!(
+            "这是账号下最后一把 key，删了账号就没法用了（现有账号 {n} 个）。\
+             停用它（enabled=false）比删掉更安全"
+        )));
+    }
+    sqlx::query("DELETE FROM api_key WHERE id = ?")
+        .bind(id)
+        .execute(&s.pool)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 每把 key 的用量：rpm / tpm / 出图张数。
+///
+/// **只统计不拦截。** 限流是并发闸门的事（`key_gate`），这里是给人和调用方
+/// 看的读数。想按分钟看趋势就带 `minutes`，不带则只要今日汇总。
+pub async fn api_key_stats(
+    State(s): Shared,
+    _a: AdminAuthed,
+    Path(id): Path<i64>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> ApiResult<Json<Value>> {
+    let minutes: i64 = q
+        .get("minutes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+        .clamp(0, 1440);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    let today_row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(requests),0), COALESCE(SUM(prompt_tokens+completion_tokens),0),
+                COALESCE(SUM(image_count),0), COALESCE(SUM(cost_micro),0), COALESCE(SUM(errors),0)
+         FROM usage_daily WHERE api_key_id = ? AND day = ?",
+    )
+    .bind(id)
+    .bind(&today)
+    .fetch_one(&s.pool)
+    .await
+    .unwrap_or((0, 0, 0, 0, 0));
+
+    // 按分钟分桶。`created_at` 是秒，除 60 向下取整即分钟序号。
+    let series: Vec<(i64, i64, i64, i64)> = if minutes > 0 {
+        sqlx::query_as(
+            "SELECT created_at / 60, COUNT(*),
+                    COALESCE(SUM(prompt_tokens+completion_tokens),0), COALESCE(SUM(image_count),0)
+             FROM request_log
+             WHERE api_key_id = ?
+               AND created_at >= strftime('%s','now') - ?
+             GROUP BY created_at / 60 ORDER BY 1",
+        )
+        .bind(id)
+        .bind(minutes * 60)
+        .fetch_all(&s.pool)
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    Ok(Json(json!({
+        "key_id": id,
+        "today": {
+            "day": today,
+            "requests": today_row.0,
+            "tokens": today_row.1,
+            "images": today_row.2,
+            "cost_micro": today_row.3,
+            "errors": today_row.4,
+        },
+        // 每分钟一根柱子：requests=该分钟请求数，tokens=该分钟 token 数
+        "series": series.iter().map(|(m, r, t, i)| json!({
+            "minute": m * 60,
+            "requests": r,
+            "tokens": t,
+            "images": i,
+        })).collect::<Vec<_>>(),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -363,12 +686,11 @@ pub async fn account_txns(
     _a: AdminAuthed,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<Value>> {
-    let rows = sqlx::query(
-        "SELECT * FROM balance_txn WHERE account_id = ? ORDER BY id DESC LIMIT 200",
-    )
-    .bind(id)
-    .fetch_all(&s.pool)
-    .await?;
+    let rows =
+        sqlx::query("SELECT * FROM balance_txn WHERE account_id = ? ORDER BY id DESC LIMIT 200")
+            .bind(id)
+            .fetch_all(&s.pool)
+            .await?;
     let items: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -598,7 +920,11 @@ fn mask(secret: &str) -> String {
     if secret.len() <= 4 {
         "****".into()
     } else {
-        format!("{}{}", &secret[..2], "*".repeat(secret.len().saturating_sub(6)))
+        format!(
+            "{}{}",
+            &secret[..2],
+            "*".repeat(secret.len().saturating_sub(6))
+        )
     }
 }
 
@@ -671,7 +997,12 @@ pub async fn update_key(
     .bind(b.label.as_deref())
     .bind(b.sort_order)
     .bind(b.enabled.map(|v| v as i64))
-    .bind(b.rate_limit_scope.as_deref().map(RateLimitScope::parse).map(RateLimitScope::as_str))
+    .bind(
+        b.rate_limit_scope
+            .as_deref()
+            .map(RateLimitScope::parse)
+            .map(RateLimitScope::as_str),
+    )
     .bind(b.secret.as_deref().map(str::trim))
     .bind(b.soft_cap_window_ms)
     .bind(b.soft_cap_tokens)
@@ -716,12 +1047,11 @@ pub async fn key_events(
     _a: AdminAuthed,
     Path(key_id): Path<i64>,
 ) -> ApiResult<Json<Value>> {
-    let rows = sqlx::query(
-        "SELECT * FROM key_rotation_event WHERE key_id = ? ORDER BY id DESC LIMIT 50",
-    )
-    .bind(key_id)
-    .fetch_all(&s.pool)
-    .await?;
+    let rows =
+        sqlx::query("SELECT * FROM key_rotation_event WHERE key_id = ? ORDER BY id DESC LIMIT 50")
+            .bind(key_id)
+            .fetch_all(&s.pool)
+            .await?;
     let items: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -763,7 +1093,9 @@ pub async fn list_routes(State(s): Shared, _a: AdminAuthed) -> ApiResult<Json<Va
             })
         })
         .collect();
-    Ok(Json(json!({ "items": items, "models": s.snapshot().models() })))
+    Ok(Json(
+        json!({ "items": items, "models": s.snapshot().models() }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1107,7 +1439,10 @@ pub async fn create_workflow(
     )
     .bind(&b.name)
     .bind(b.mode.as_deref().unwrap_or("template"))
-    .bind(serde_json::to_string(&b.node_ids.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".into()))
+    .bind(
+        serde_json::to_string(&b.node_ids.clone().unwrap_or_default())
+            .unwrap_or_else(|_| "[]".into()),
+    )
     .bind(b.comfy_workflow.clone().unwrap_or_else(|| "{}".into()))
     .bind(b.price_micro.unwrap_or(0))
     .bind(b.enabled.unwrap_or(true) as i64)
@@ -1161,7 +1496,10 @@ pub async fn update_workflow(
     )
     .bind(&b.name)
     .bind(b.mode.as_deref())
-    .bind(b.node_ids.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())))
+    .bind(
+        b.node_ids
+            .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())),
+    )
     .bind(b.comfy_workflow.as_deref())
     .bind(b.price_micro)
     .bind(b.enabled.map(|v| v as i64))
@@ -1235,6 +1573,7 @@ pub async fn dry_run_workflow(
 #[derive(Deserialize, Default)]
 pub struct UsageQuery {
     pub account_id: Option<i64>,
+    pub api_key_id: Option<i64>,
     pub target: Option<String>,
     pub status: Option<String>,
     pub protocol: Option<String>,
@@ -1253,17 +1592,22 @@ pub async fn list_logs(
     let size = q.page_size.unwrap_or(50).clamp(1, 500);
     let (items, total) = usage::list(
         &s.pool,
-        q.account_id,
-        q.target.as_deref(),
-        q.status.as_deref(),
-        q.protocol.as_deref(),
-        q.from,
-        q.to,
-        size,
-        (page - 1) * size,
+        usage::LogFilter {
+            account_id: q.account_id,
+            api_key_id: q.api_key_id,
+            target: q.target.as_deref(),
+            status: q.status.as_deref(),
+            protocol: q.protocol.as_deref(),
+            from: q.from,
+            to: q.to,
+            limit: size,
+            offset: (page - 1) * size,
+        },
     )
     .await?;
-    Ok(Json(json!({ "items": items, "total": total, "page": page, "page_size": size })))
+    Ok(Json(
+        json!({ "items": items, "total": total, "page": page, "page_size": size }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1325,7 +1669,10 @@ pub async fn overview(State(s): Shared, _a: AdminAuthed) -> ApiResult<Json<Value
         .iter()
         .filter(|n| health.get(&n.id).map(|h| h.healthy).unwrap_or(true))
         .count();
-    let cooling = health.values().filter(|h| h.cooldown_secs_remaining > 0).count();
+    let cooling = health
+        .values()
+        .filter(|h| h.cooldown_secs_remaining > 0)
+        .count();
 
     Ok(Json(json!({
         "today": { "day": today, "cost_micro": day.0, "requests": day.1, "errors": day.2, "images": day.3 },
@@ -1366,21 +1713,31 @@ pub async fn runtime(State(s): Shared, _a: AdminAuthed) -> ApiResult<Json<Value>
             "max_concurrency": n.max_concurrency, "active": st.active, "waiting": st.waiting,
         }));
     }
-    let mut accounts = Vec::new();
-    for r in sqlx::query("SELECT id, name, balance_micro, held_micro FROM account WHERE enabled = 1 ORDER BY id")
-        .fetch_all(&s.pool)
-        .await?
+    // 闸门是 **key 级**的，所以这里列的也是 key。账号层面没有闸门——
+    // 建 3 把 key 就是 3 份并发，额度全在 key 上。
+    let mut key_slots = Vec::new();
+    for r in sqlx::query(
+        "SELECT k.id, k.name, k.enabled, a.id AS account_id, a.name AS account_name
+         FROM api_key k JOIN account a ON a.id = k.account_id
+         WHERE a.enabled = 1 ORDER BY a.id, k.id",
+    )
+    .fetch_all(&s.pool)
+    .await?
     {
-        let id = r.get::<i64, _>("id");
-        let st = s.account_gate(id).await.snapshot(i64::MAX).await;
-        accounts.push(json!({
-            "id": id, "name": r.get::<String, _>("name"),
-            "balance_micro": r.get::<i64, _>("balance_micro"),
-            "held_micro": r.get::<i64, _>("held_micro"),
+        let kid = r.get::<i64, _>("id");
+        let st = s.key_gate(kid).await.snapshot(i64::MAX).await;
+        key_slots.push(json!({
+            "id": kid,
+            "name": r.get::<String, _>("name"),
+            "account_id": r.get::<i64, _>("account_id"),
+            "account_name": r.get::<String, _>("account_name"),
+            "enabled": r.get::<i64, _>("enabled") != 0,
             "active": st.active, "waiting": st.waiting,
         }));
     }
-    Ok(Json(json!({ "nodes": nodes, "comfy_nodes": comfy, "accounts": accounts })))
+    Ok(Json(
+        json!({ "nodes": nodes, "comfy_nodes": comfy, "keys": key_slots }),
+    ))
 }
 
 // ── 设置 ────────────────────────────────────────────────────────────────────
@@ -1442,7 +1799,9 @@ pub async fn list_backups(State(s): Shared, _a: AdminAuthed) -> ApiResult<Json<V
             })
         })
         .collect();
-    Ok(Json(json!({ "items": items, "dir": s.cfg.backup_dir().display().to_string() })))
+    Ok(Json(
+        json!({ "items": items, "dir": s.cfg.backup_dir().display().to_string() }),
+    ))
 }
 
 /// 立刻备份一次。手动触发与每日任务走**同一条路径**，
@@ -1468,12 +1827,100 @@ pub async fn backup_retention(State(s): Shared, _a: AdminAuthed) -> ApiResult<Js
 /// `NOT NULL DEFAULT '{}'`，绑 NULL 会直接触发约束失败。
 /// 读路径本来就容忍非法 JSON（回退空对象），所以这里给 "{}" 即可。
 fn json_str(v: &Option<Value>) -> String {
-    v.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "{}".into())
+    v.as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "{}".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn session_pool() -> sqlx::SqlitePool {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let path = dir.path().join("a.db");
+        let pool = crate::db::connect(&path).await.expect("建库");
+        crate::db::migrate::MIGRATOR
+            .run(&pool)
+            .await
+            .expect("跑迁移");
+        std::mem::forget(dir);
+        pool
+    }
+
+    /// 登出必须真的删掉**那把** token 对应的那一行。
+    ///
+    /// 这是本次修的 bug 的回归守卫：原来删的是 `token = ''`，
+    /// 库里一行不少，而 Cookie 已经清了——凭证照样能用满 7 天。
+    #[tokio::test]
+    async fn logout_deletes_only_its_own_session() {
+        let pool = session_pool().await;
+        let now = now();
+        for t in ["keep-me", "kill-me"] {
+            sqlx::query("INSERT INTO session (token, expires_at, created_at) VALUES (?,?,?)")
+                .bind(t)
+                .bind(now + 3600)
+                .bind(now)
+                .execute(&pool)
+                .await
+                .expect("插入会话");
+        }
+
+        let n = delete_session(&pool, "kill-me").await.expect("删会话");
+        assert_eq!(n, 1, "应当正好删掉一行");
+
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE token = 'kill-me'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "被登出的那把不该还在库里");
+
+        // 别连累别人：同一时刻可能有别的设备还登着
+        let others: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE token = 'keep-me'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(others, 1, "别的会话不该被一起删掉");
+    }
+
+    /// token 对不上时不能误删。这条曾经是反过来的：删了个空串，
+    /// 看起来「成功」了，实际一行没动。
+    #[tokio::test]
+    async fn logout_with_an_unknown_token_deletes_nothing() {
+        let pool = session_pool().await;
+        sqlx::query("INSERT INTO session (token, expires_at, created_at) VALUES ('live',?,?)")
+            .bind(now() + 3600)
+            .bind(now())
+            .execute(&pool)
+            .await
+            .expect("插入会话");
+        let n = delete_session(&pool, "not-a-real-token")
+            .await
+            .expect("删会话");
+        assert_eq!(n, 0);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 1, "会话不该被动过");
+    }
+
+    /// 套了 TLS 之后会话 cookie 必须带 `Secure`。
+    #[test]
+    fn secure_flag_follows_the_forwarded_proto() {
+        let mut h = axum::http::HeaderMap::new();
+        assert!(
+            !request_is_https(&h),
+            "明文直连不能加 Secure，否则浏览器根本不发"
+        );
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(request_is_https(&h));
+        h.insert("x-forwarded-proto", "https, http".parse().unwrap());
+        assert!(request_is_https(&h), "多跳时看第一跳");
+        h.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(!request_is_https(&h));
+    }
 
     /// 管理台的编辑弹窗不展示明文，提交上来的 body 里没有 `secret`。
     /// 这个 body 必须能反序列化，否则「改个标签」永远 422。

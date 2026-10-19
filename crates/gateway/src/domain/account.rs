@@ -1,4 +1,8 @@
-//! 账号：API Key、余额、并发额度。
+//! 账号：余额。
+//!
+//! **并发额度不在这里** —— 它在 [`super::api_key::ApiKey`] 上。
+//! 余额是账号的（同一个账号的 key 共用一份），速率是每把 key 的（各算各的）。
+//! key 曾经也是这里的一列，那时一个账号只能有一把 key，无法按 key 限流。
 
 use serde::{Deserialize, Serialize};
 
@@ -11,30 +15,12 @@ pub struct Account {
     pub balance_micro: i64,
     /// 在途预扣（微元）。准入时加、结算时减。
     pub held_micro: i64,
-    pub llm_max_concurrency: i64,
-    pub llm_max_queue: i64,
-    pub image_max_concurrency: i64,
-    pub image_max_queue: i64,
 }
 
 impl Account {
     /// 真正可再预扣的额度。
     pub fn available_micro(&self) -> i64 {
         self.balance_micro - self.held_micro
-    }
-
-    pub fn max_concurrency(&self, kind: ResourceKind) -> i64 {
-        match kind {
-            ResourceKind::Llm => self.llm_max_concurrency,
-            ResourceKind::Image => self.image_max_concurrency,
-        }
-    }
-
-    pub fn max_queue(&self, kind: ResourceKind) -> i64 {
-        match kind {
-            ResourceKind::Llm => self.llm_max_queue,
-            ResourceKind::Image => self.image_max_queue,
-        }
     }
 }
 

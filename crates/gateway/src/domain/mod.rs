@@ -1,6 +1,7 @@
 //! 领域模型：节点、模型路由、账号、工作流、定价、启用禁用时间窗。
 
 pub mod account;
+pub mod api_key;
 pub mod comfy;
 pub mod model;
 pub mod node;

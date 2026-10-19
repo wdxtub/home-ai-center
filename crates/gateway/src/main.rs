@@ -59,8 +59,9 @@ async fn main() -> anyhow::Result<()> {
         pool,
         snapshot: arc_swap::ArcSwap::from_pointee(Snapshot::default()),
         node_gates: Default::default(),
-        account_gates: Default::default(),
+        key_gates: Default::default(),
         comfy_gates: Default::default(),
+        login_throttle: Default::default(),
     });
     // 快照必须在挂路由之前就绪，否则第一个请求会读到空配置
     state.reload().await?;
@@ -134,7 +135,15 @@ fn router(state: Arc<AppState>) -> Router {
             "/accounts/{id}",
             put(admin::update_account).delete(admin::delete_account),
         )
-        .route("/accounts/{id}/key", post(admin::rotate_account_key))
+        // 调用方的 key。和下面的「节点 key」是两回事，路径也分开：
+        // 节点 key 是上游那把 LLM key，这里是调用方自己的 key。
+        .route("/accounts/{id}/api-keys", post(admin::create_api_key))
+        .route(
+            "/api-keys/{id}",
+            put(admin::update_api_key).delete(admin::delete_api_key),
+        )
+        .route("/api-keys/{id}/rotate", post(admin::rotate_api_key))
+        .route("/api-keys/{id}/stats", get(admin::api_key_stats))
         .route("/accounts/{id}/topup", post(admin::topup))
         .route("/accounts/{id}/txns", get(admin::account_txns))
         // 节点
@@ -188,14 +197,97 @@ fn router(state: Arc<AppState>) -> Router {
         .with_state(s.clone())
         .merge(admin_public);
 
-    Router::new()
+    let cors = build_cors(&state.cfg);
+
+    let app = Router::new()
         .route("/api/health", get(health))
         .nest("/v1", gateway)
         .nest("/api/admin", admin)
         .fallback(hac::webui::serve)
         .layer(TraceLayer::new_for_http())
-        .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(s)
+        .with_state(s);
+
+    // 默认**不加** CORS 层 = 只允许同源。真要跨源就显式列出来。
+    match cors {
+        Some(c) => app.layer(c),
+        None => app,
+    }
+}
+
+/// 跨域白名单。没配就返回 `None`，即「什么都不加」。
+///
+/// 之前这里是 `CorsLayer::permissive()`：任意网页都能带着调用方 key
+/// 跨域打 `/v1` 并**读到响应**。管理面因为 Cookie 是 `SameSite=Strict`
+/// 且 permissive 不带 credentials，勉强挡住；网关面没有任何东西挡。
+fn build_cors(cfg: &Config) -> Option<tower_http::cors::CorsLayer> {
+    use axum::http::{header, HeaderName, Method};
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+
+    let (origins, bad) = split_cors_origins(&cfg.cors_origins);
+    // 配错的项必须**看得见**。静默丢掉一个拼错的 origin 属于「配了不生效」：
+    // 跨域请求照样被浏览器拦，而用户只会看到一个 CORS 报错，
+    // 根本猜不到是自己少写了 `https://`。
+    for o in &bad {
+        tracing::warn!(
+            origin = %o,
+            "HOME_AI_CORS_ORIGINS 里这一项不是合法的 Origin，已忽略；\
+             必须带 scheme，例如 https://your-ui.example.org"
+        );
+    }
+    if origins.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            // 只放行真正用到的头，不放行 `Any`：头名是攻击面，
+            // 白名单比「全放」多一行字、少一个洞。
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                HeaderName::from_static("x-api-key"),
+                HeaderName::from_static("x-admin-token"),
+                HeaderName::from_static("anthropic-version"),
+            ]),
+    )
+}
+
+/// 把 `HOME_AI_CORS_ORIGINS` 拆成「能用的」和「用不了的」两份。
+///
+/// 分两份就是为了让配错的项能被告警出来。返回 `None` 不行——那等于
+/// 又变回「配了不生效」，正是这个函数要消灭的东西。
+///
+/// **光靠 `HeaderValue::from_str` 是不够的**：裸主机名
+/// `your-ui.example.org` 是个合法的 header 值，于是会被「通过」，
+/// 但它永远匹配不上浏览器发来的任何 `Origin`——配了等于没配。
+/// 所以先按 Origin 的实际形态校验，再交给 `HeaderValue`。
+fn split_cors_origins(raw: &[String]) -> (Vec<axum::http::HeaderValue>, Vec<&str>) {
+    let mut ok = Vec::new();
+    let mut bad = Vec::new();
+    for o in raw {
+        let lower = o.to_ascii_lowercase();
+        // 浏览器发来的 Origin 只可能是 http(s)://host[:port]。
+        // 沙箱 iframe 的 `null` 那种源本来就不该白名单放行。
+        let shaped = (lower.starts_with("http://") || lower.starts_with("https://"))
+            // 结尾斜杠是第二个经典配错：Origin 头里没有它，永远匹配不上
+            && !o.ends_with('/');
+        if !shaped {
+            bad.push(o.as_str());
+            continue;
+        }
+        match o.parse::<axum::http::HeaderValue>() {
+            Ok(v) => ok.push(v),
+            Err(_) => bad.push(o.as_str()),
+        }
+    }
+    (ok, bad)
 }
 
 /// 管理面守卫。挂在 `route_layer` 上，`/auth/login` 因为在
@@ -267,5 +359,71 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("收到 Ctrl+C"),
         _ = terminate => tracing::info!("收到 SIGTERM"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 少写 `https://` 是最常见的配错。它必须能被单独挑出来告警，
+    /// 而不是和没配过一样安静——否则用户只会看到一个 CORS 报错。
+    #[test]
+    fn a_broken_origin_is_reported_not_swallowed() {
+        let raw = v(&["your-ui.example.org"]);
+        let (ok, bad) = split_cors_origins(&raw);
+        assert!(ok.is_empty(), "没 scheme 的不该通过");
+        assert_eq!(bad, vec!["your-ui.example.org"]);
+    }
+
+    #[test]
+    fn a_well_formed_origin_passes() {
+        let raw = v(&["https://your-ui.example.org"]);
+        let (ok, bad) = split_cors_origins(&raw);
+        assert_eq!(ok.len(), 1);
+        assert!(bad.is_empty());
+    }
+
+    /// 一好一坏时要各归各位，不能因为有一个坏的就整份丢弃。
+    #[test]
+    fn good_and_bad_are_separated() {
+        let raw = v(&[
+            "https://a.example.org",
+            "not a origin",
+            "https://b.example.org",
+        ]);
+        let (ok, bad) = split_cors_origins(&raw);
+        assert_eq!(ok.len(), 2);
+        assert_eq!(bad, vec!["not a origin"]);
+    }
+
+    /// 结尾斜杠同样匹配不上（Origin 头里没有），也必须被挑出来。
+    #[test]
+    fn a_trailing_slash_is_also_rejected() {
+        let raw = v(&["https://your-ui.example.org/"]);
+        let (ok, bad) = split_cors_origins(&raw);
+        assert!(ok.is_empty());
+        assert_eq!(bad, vec!["https://your-ui.example.org/"]);
+    }
+
+    /// 端口是 Origin 的合法一部分，别把它一起拒了。
+    #[test]
+    fn a_port_is_kept() {
+        let raw = v(&["http://192.168.1.20:5173"]);
+        let (ok, bad) = split_cors_origins(&raw);
+        assert_eq!(ok.len(), 1, "带端口的源要能通过");
+        assert!(bad.is_empty());
+    }
+
+    /// 默认（没配）时不能凭空造出任何白名单——那就是 permissive 复活。
+    #[test]
+    fn nothing_configured_means_nothing_allowed() {
+        let (ok, bad) = split_cors_origins(&[]);
+        assert!(ok.is_empty());
+        assert!(bad.is_empty());
     }
 }

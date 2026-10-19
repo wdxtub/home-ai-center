@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use crate::api::auth::Authed;
 use crate::billing::{ledger, usage};
 use crate::domain::account::{Account, ResourceKind};
+use crate::domain::api_key::ApiKey;
 use crate::domain::node::NodeKey;
 use crate::domain::pricing::{ModelPrice, PriceTable};
 use crate::error::{ApiError, ApiResult};
@@ -38,6 +39,7 @@ use crate::protocol::sse::SseFrame;
 use crate::protocol::{chat, messages, responses, tokenize, upstream_chat, Protocol};
 use crate::state::AppState;
 use crate::upstream::openai::{self, UpstreamError};
+use crate::upstream::sanitize;
 
 fn new_request_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -85,7 +87,7 @@ pub async fn chat_completions(
     body: axum::Json<Value>,
 ) -> ApiResult<Response> {
     let req = chat::parse_request(&body)?;
-    serve(s, a.0, req, Protocol::Chat).await
+    serve(s, a.account, a.key, req, Protocol::Chat).await
 }
 
 pub async fn responses(
@@ -94,7 +96,7 @@ pub async fn responses(
     body: axum::Json<Value>,
 ) -> ApiResult<Response> {
     let req = responses::parse_request(&body)?;
-    serve(s, a.0, req, Protocol::Responses).await
+    serve(s, a.account, a.key, req, Protocol::Responses).await
 }
 
 /// 注意提取器顺序：axum 要求**所有 parts 提取器在前**，
@@ -120,7 +122,7 @@ pub async fn messages(
             .map(|v| v as u32)
             .or(Some(4096));
     }
-    serve(s, a.0, req, Protocol::Messages).await
+    serve(s, a.account, a.key, req, Protocol::Messages).await
 }
 
 // ── 预扣的持有权 ────────────────────────────────────────────────────────────
@@ -218,6 +220,7 @@ impl Drop for Reservation {
 async fn serve(
     s: Arc<AppState>,
     acct: Account,
+    key: ApiKey,
     req: UnifiedRequest,
     protocol: Protocol,
 ) -> ApiResult<Response> {
@@ -249,6 +252,7 @@ async fn serve(
     match run_admission(
         &s,
         &acct,
+        &key,
         req,
         protocol,
         &request_id,
@@ -264,6 +268,7 @@ async fn serve(
             log_failure(
                 &s,
                 &acct,
+                &key,
                 &fail_model,
                 fail_stream,
                 protocol,
@@ -283,6 +288,8 @@ async fn serve(
 struct LogCtx {
     request_id: String,
     account_id: i64,
+    /// 调用方那把 key。rpm / tpm / 张数就是按它分桶的。
+    api_key_id: i64,
     protocol: Protocol,
     /// 流式与非流式共用同一条落库路径，这个字段必须如实填。
     stream: bool,
@@ -299,6 +306,7 @@ struct LogCtx {
 async fn run_admission(
     s: &Arc<AppState>,
     acct: &Account,
+    key: &ApiKey,
     req: UnifiedRequest,
     protocol: Protocol,
     request_id: &str,
@@ -309,19 +317,20 @@ async fn run_admission(
     let queue_timeout = Duration::from_secs(s.cfg.queue_timeout_secs);
     let est_input = tokenize::estimate_request(&req);
 
-    // ③ 账号闸门：先拿到公平额度，再去抢节点。
-    //    这一份名额要**占满整个请求**——包括中途换 key、换点，
-    //    以及整个流式过程。中途丢掉就等于绕过了账号并发上限。
-    let acct_gate = s.account_gate(acct.id).await;
-    let acct_lease = acct_gate
+    // ③ key 闸门：先拿到公平额度，再去抢节点。
+    //    这一份名额要**占满整个请求**——包括中途换上游 key、换点，
+    //    以及整个流式过程。中途丢掉就等于绕过了这把 key 的并发上限。
+    //    额度是 **key 级**的：同一账号的各把 key 各限各的。
+    let key_gate = s.key_gate(key.id).await;
+    let key_lease = key_gate
         .acquire(
-            acct.max_concurrency(ResourceKind::Llm),
-            acct.max_queue(ResourceKind::Llm),
+            key.max_concurrency(ResourceKind::Llm),
+            key.max_queue(ResourceKind::Llm),
             Priority::Batch,
             Some(queue_timeout),
         )
         .await
-        .map_err(|e| ApiError::queue_full(format!("当前账号并发已满：{e}")))?;
+        .map_err(|e| ApiError::queue_full(format!("API Key「{}」并发已满：{e}", key.name)))?;
 
     let http = openai::OpenAiClient::new(300).map_err(|e| ApiError::internal(e.to_string()))?;
     let sched = NodeScheduler::new(s.health.clone(), s.keys.clone());
@@ -405,6 +414,7 @@ async fn run_admission(
         let ctx = LogCtx {
             request_id: request_id.to_string(),
             account_id: acct.id,
+            api_key_id: key.id,
             protocol,
             stream: req.stream,
             model: req.model.clone(),
@@ -445,7 +455,7 @@ async fn run_admission(
                 ctx.estimated = estimated;
                 usage::write(
                     &s.pool,
-                    &log_entry(&ctx, usage, estimated, elapsed_ms(started), cost),
+                    &log_entry(&ctx, usage, estimated, elapsed_ms(started), None, cost),
                 )
                 .await
                 .ok();
@@ -453,7 +463,7 @@ async fn run_admission(
                 drop(pick.lease);
                 sched.health.mark_success(pick.node.id).await;
                 let body = render_once(protocol, &resp);
-                drop(acct_lease);
+                drop(key_lease);
                 return Ok(json_response(body));
             }
             Ok(ExecResult::Stream(resp)) => {
@@ -467,8 +477,9 @@ async fn run_admission(
                     est_input,
                     out_chars: 0,
                     price: *price,
+                    first_content_at: None,
                     _slots: HeldSlots {
-                        _account: acct_lease,
+                        _key: key_lease,
                         _node: pick.lease,
                     },
                 };
@@ -483,9 +494,11 @@ async fn run_admission(
                 if let Some(at) = verdict.reset_at {
                     exhausted_at = Some(exhausted_at.map_or(at, |v: i64| v.min(at)));
                 }
+                // 上游 key 的 label 是网关内部信息，调用方只需要知道「限额了」
                 last_err = Some(ApiError::no_capacity(format!(
-                    "模型 {} 的 key「{}」已限额（{}）",
-                    req.model, pick.key.label, verdict.signal
+                    "模型 {} 的上游凭证已限额（{}）",
+                    req.model,
+                    sanitize::sanitize(&verdict.signal)
                 )));
                 tried_nodes.push(pick.node.id);
                 drop(pick.lease);
@@ -501,7 +514,8 @@ async fn run_admission(
                 // 瞬时类：原地等，**不换 key**
                 let wait = retry_after_secs.unwrap_or(5).clamp(1, 30);
                 tokio::time::sleep(Duration::from_secs(wait)).await;
-                last_err = Some(ApiError::upstream(message));
+                tracing::warn!(error = %message, "上游瞬时失败，退避后重试");
+                last_err = Some(ApiError::upstream(sanitize::sanitize(&message)));
                 continue;
             }
             Err(UpstreamError::Node { hard, message }) => {
@@ -514,7 +528,10 @@ async fn run_admission(
                         &message,
                     )
                     .await;
-                last_err = Some(ApiError::upstream(message));
+                // 原文只进日志：它多半带着内网地址，回给调用方等于
+                // 告诉外人这台网关后面接着什么
+                tracing::warn!(node = %pick.node.name, error = %message, "上游节点故障");
+                last_err = Some(ApiError::upstream(sanitize::sanitize(&message)));
                 tried_nodes.push(pick.node.id);
                 drop(pick.lease);
                 continue;
@@ -530,10 +547,15 @@ async fn run_admission(
                         &message,
                     )
                     .await;
-                last_err = Some(ApiError::upstream(format!(
-                    "节点 {} 的所有地址都连不上：{message}",
-                    pick.node.name
-                )));
+                tracing::warn!(node = %pick.node.name, error = %message, "上游节点不可达");
+                // 节点名与地址同样不外泄：调用方据此决定「等」还是「改路由」就够，
+                // 不需要知道这台网关后面接着哪台机器
+                let hint = if timeout {
+                    "上游超时，请稍后重试"
+                } else {
+                    "上游节点不可达，请检查节点是否已启动"
+                };
+                last_err = Some(ApiError::upstream(hint.to_string()));
                 tried_nodes.push(pick.node.id);
                 drop(pick.lease);
                 continue;
@@ -653,7 +675,8 @@ fn renderer_for(
 
 /// 流式请求占住的名额。活到流结束为止。
 struct HeldSlots {
-    _account: SlotLease,
+    /// 调用方那把 key 的并发名额。额度是 key 级的，不是账号级。
+    _key: SlotLease,
     _node: SlotLease,
 }
 
@@ -669,6 +692,9 @@ struct StreamTail {
     est_input: u32,
     out_chars: usize,
     price: ModelPrice,
+    /// 收到**第一个带内容**的事件的时刻，`None` = 至今没收到。
+    /// 用来算 TTFT，见 `0007_stream_timing.sql`。
+    first_content_at: Option<Instant>,
     _slots: HeldSlots,
 }
 
@@ -681,6 +707,7 @@ struct TailSnapshot {
     est_input: u32,
     out_chars: usize,
     price: ModelPrice,
+    first_content_at: Option<Instant>,
 }
 
 impl StreamTail {
@@ -693,6 +720,7 @@ impl StreamTail {
             est_input: self.est_input,
             out_chars: self.out_chars,
             price: self.price,
+            first_content_at: self.first_content_at,
         }
     }
 }
@@ -743,11 +771,36 @@ impl TailSnapshot {
         ctx.estimated = estimated;
         usage::write(
             &self.state.pool,
-            &log_entry(&ctx, usage, estimated, elapsed_ms(ctx.started), cost),
+            &log_entry(
+                &ctx,
+                usage,
+                estimated,
+                elapsed_ms(ctx.started),
+                self.first_content_at
+                    .map(|at| ttft_ms(at, ctx.started, ctx.queue_wait_ms)),
+                cost,
+            ),
         )
         .await
         .ok();
     }
+}
+
+/// 上游首 token 等待毫秒，**已扣掉在网关排队的时间**。
+///
+/// 扣排队是因为队列满时可能等几十秒，衡量的是网关的并发额度而不是
+/// 上游的性能；两个上游的对比不该被排队噪声盖掉。要含排队的墙钟值
+/// 自己加 `queue_wait_ms` 回去。
+///
+/// 返回 `None` 表示「没有首 token」：流一直没吐出内容就被掐断了。
+/// 这种情况**不能记 0**——0 会被读成「快得离谱」。
+fn ttft_ms(first_content_at: Instant, started: Instant, queue_wait_ms: i64) -> i64 {
+    let wall = first_content_at
+        .saturating_duration_since(started)
+        .as_millis() as i64;
+    // 排队与 TTFT 不会重叠，但计时器有毫秒取整误差，
+    // 极端情况会差出 -1。夹到 0，别让一个负数落库。
+    (wall - queue_wait_ms).max(0)
 }
 
 /// 成功路径的落库条目。失败路径另走 [`log_failure`]。
@@ -756,17 +809,20 @@ fn log_entry(
     u: UnifiedUsage,
     estimated: bool,
     latency_ms: i64,
+    ttft_ms: Option<i64>,
     cost: i64,
 ) -> usage::LogEntry {
     usage::LogEntry {
         request_id: ctx.request_id.clone(),
         account_id: ctx.account_id,
+        api_key_id: ctx.api_key_id,
         kind: "llm",
         protocol: Some(ctx.protocol.as_str()),
         target: ctx.model.clone(),
         node_id: Some(ctx.node.node_id),
         node_name: Some(ctx.node_name.clone()),
-        key_id: Some(ctx.node.id),
+        // 上游那把 key，和 api_key_id 不是一回事
+        node_key_id: Some(ctx.node.id),
         rotated_count: ctx.rotated,
         stream: ctx.stream,
         status: "ok",
@@ -774,6 +830,7 @@ fn log_entry(
         error_message: None,
         queue_wait_ms: ctx.queue_wait_ms,
         latency_ms,
+        ttft_ms,
         usage: u,
         tokens_source: if estimated { "estimated" } else { "upstream" },
         image_count: 0,
@@ -879,6 +936,13 @@ fn build_stream(
                             UnifiedEvent::Done { usage, .. } => st.tail.usage = *usage,
                             _ => {}
                         }
+                        // TTFT 打点：**第一个带内容的事件**。
+                        // 不能拿 `lead` 帧当首帧——Anthropic 的
+                        // `message_start` 在上游任何内容到达之前就发出去了，
+                        // 拿它计时会得出「TTFT = 0」这种看着很美的假数。
+                        if st.tail.first_content_at.is_none() && ev.carries_content() {
+                            st.tail.first_content_at = Some(Instant::now());
+                        }
                         st.pump.feed(&ev);
                     }
                     None => {
@@ -925,6 +989,7 @@ fn render_once(protocol: Protocol, r: &UnifiedResponse) -> Value {
 async fn log_failure(
     s: &Arc<AppState>,
     acct: &Account,
+    key: &ApiKey,
     model: &str,
     stream: bool,
     protocol: Protocol,
@@ -937,12 +1002,13 @@ async fn log_failure(
         &usage::LogEntry {
             request_id: request_id.to_string(),
             account_id: acct.id,
+            api_key_id: key.id,
             kind: "llm",
             protocol: Some(protocol.as_str()),
             target: model.to_string(),
             node_id: None,
             node_name: None,
-            key_id: None,
+            node_key_id: None,
             rotated_count: 0,
             stream,
             status: "error",
@@ -950,6 +1016,8 @@ async fn log_failure(
             error_message: Some(e.message.clone()),
             queue_wait_ms: 0,
             latency_ms: elapsed_ms(started),
+            // 失败发生在拿到上游响应之前，流都没开始，没有首 token
+            ttft_ms: None,
             usage: UnifiedUsage::default(),
             tokens_source: "none",
             image_count: 0,
@@ -972,26 +1040,50 @@ pub async fn usage_info(
         "SELECT COALESCE(SUM(cost_micro),0), COALESCE(SUM(prompt_tokens+completion_tokens),0), COUNT(*)
          FROM usage_daily WHERE account_id = ? AND day = ?",
     )
-    .bind(a.0.id)
+    .bind(a.account.id)
     .bind(&today)
     .fetch_one(&s.pool)
     .await?;
+
+    // 这把 key 自己的今日用量。和上面的账号总量分开，
+    // 否则「一个账号多把 key」时每把都看到全量，分不出谁花的。
+    let key_today: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(cost_micro),0), COALESCE(SUM(prompt_tokens+completion_tokens),0),
+                COUNT(*), COALESCE(SUM(image_count),0)
+         FROM usage_daily WHERE api_key_id = ? AND day = ?",
+    )
+    .bind(a.key.id)
+    .bind(&today)
+    .fetch_one(&s.pool)
+    .await
+    .unwrap_or((0, 0, 0, 0));
 
     let by_protocol: Vec<(String, i64)> = sqlx::query_as(
         "SELECT COALESCE(protocol,'llm'), COUNT(*) FROM request_log
          WHERE account_id = ? AND created_at >= strftime('%s','now','-30 days')
          GROUP BY 1",
     )
-    .bind(a.0.id)
+    .bind(a.account.id)
     .fetch_all(&s.pool)
     .await
     .unwrap_or_default();
 
     Ok(Json(json!({
-        "account": a.0.name,
-        "balance_micro": a.0.balance_micro,
-        "held_micro": a.0.held_micro,
-        "available_micro": a.0.available_micro(),
+        "account": a.account.name,
+        "balance_micro": a.account.balance_micro,
+        "held_micro": a.account.held_micro,
+        "available_micro": a.account.available_micro(),
+        // 余额是账号的（共用），额度是这把 key 的（独立）。
+        // 调用方问「我今天花了多少、还能用多少」时，两个都要看。
+        "key": {
+            "id": a.key.id,
+            "name": a.key.name,
+            "prefix": a.key.key_prefix,
+            "llm_max_concurrency": a.key.llm_max_concurrency,
+            "image_max_concurrency": a.key.image_max_concurrency,
+        },
+        // 今天这笔账里这把 key 自己占多少（不是整个账号）
+        "today_by_key": key_today,
         "today": { "cost_micro": row.0, "tokens": row.1, "requests": row.2, "day": today },
         "requests_by_protocol_30d": by_protocol
             .into_iter()
@@ -1189,5 +1281,24 @@ mod tests {
             .filter(|f| f.data.contains("input_json_delta"))
             .collect();
         assert_eq!(arg_frames.len(), 1);
+    }
+
+    // ── TTFT 计时 ───────────────────────────────────────────────────────────
+
+    /// 排队时间要从 TTFT 里扣掉：队列满时可能等几十秒，衡量的是网关的
+    /// 并发额度而不是上游性能。5000ms 里排了 4000ms，上游只该算 1000ms。
+    #[test]
+    fn ttft_excludes_the_gateway_queue() {
+        let start = Instant::now();
+        let first = start + Duration::from_millis(5_000);
+        assert_eq!(ttft_ms(first, start, 4_000), 1_000);
+    }
+
+    /// 毫秒取整可能差出 -1，落库必须是 0，不能是负数。
+    #[test]
+    fn ttft_never_goes_negative() {
+        let start = Instant::now();
+        let first = start + Duration::from_millis(100);
+        assert_eq!(ttft_ms(first, start, 150), 0);
     }
 }

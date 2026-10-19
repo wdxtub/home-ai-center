@@ -240,6 +240,23 @@ pub enum UnifiedEvent {
     Error { message: String, code: Option<String> },
 }
 
+impl UnifiedEvent {
+    /// 这个事件**带内容**吗？用来给 TTFT 打第一个点。
+    ///
+    /// 「带内容」= 客户端能从中看到模型输出的东西：正文、思考、工具调用。
+    /// `Done` 与 `Error` 不算——它们是收尾信号，`ToolCallEnd` 也不算。
+    /// 拿收尾信号当首帧会得出「TTFT = 流总耗时」，那不是首 token。
+    pub fn carries_content(&self) -> bool {
+        matches!(
+            self,
+            Self::TextDelta { .. }
+                | Self::ReasoningDelta { .. }
+                | Self::ToolCallStart { .. }
+                | Self::ToolCallArgsDelta { .. }
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +299,41 @@ mod tests {
     fn finish_reason_parses_legacy_function_call() {
         assert_eq!(FinishReason::from_upstream("function_call"), FinishReason::ToolCalls);
         assert_eq!(FinishReason::from_upstream("wat"), FinishReason::Other);
+    }
+
+    /// 收尾信号不算「带内容」。拿 Done/Error 当首帧，TTFT 会变成整条流的
+    /// 总耗时——那不是首 token，是个看起来很像的错数。
+    #[test]
+    fn terminator_events_do_not_carry_content() {
+        let u = UnifiedUsage::default();
+        assert!(!UnifiedEvent::Done {
+            usage: u,
+            finish_reason: None
+        }
+        .carries_content());
+        assert!(!UnifiedEvent::Error {
+            message: "boom".into(),
+            code: None
+        }
+        .carries_content());
+        assert!(!UnifiedEvent::ToolCallEnd { index: 0 }.carries_content());
+    }
+
+    /// 正文、思考、工具调用都算内容——工具调用同样是模型在输出。
+    #[test]
+    fn real_output_events_carry_content() {
+        assert!(UnifiedEvent::TextDelta { text: "hi".into() }.carries_content());
+        assert!(UnifiedEvent::ReasoningDelta { text: "…".into() }.carries_content());
+        assert!(UnifiedEvent::ToolCallStart {
+            index: 0,
+            id: "t1".into(),
+            name: "get".into()
+        }
+        .carries_content());
+        assert!(UnifiedEvent::ToolCallArgsDelta {
+            index: 0,
+            fragment: "{}".into()
+        }
+        .carries_content());
     }
 }

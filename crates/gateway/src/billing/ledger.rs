@@ -295,8 +295,8 @@ mod tests {
     async fn add_account(pool: &sqlx::SqlitePool, balance: i64) -> i64 {
         let now = unix_now();
         sqlx::query(
-            "INSERT INTO account (name, api_key_hash, api_key_prefix, balance_micro, created_at, updated_at)
-             VALUES ('t','h','p',?,?,?)",
+            "INSERT INTO account (name, balance_micro, created_at, updated_at)
+             VALUES ('t',?,?,?)",
         )
         .bind(balance)
         .bind(now)

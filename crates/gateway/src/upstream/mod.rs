@@ -6,4 +6,5 @@
 
 pub mod comfyui;
 pub mod openai;
+pub mod sanitize;
 pub mod workflow;

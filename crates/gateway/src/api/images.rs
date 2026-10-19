@@ -33,6 +33,7 @@ use crate::gate::Priority;
 use crate::protocol::ir::UnifiedUsage;
 use crate::state::AppState;
 use crate::upstream::comfyui::{ComfyClient, ComfyError};
+use crate::upstream::sanitize;
 use crate::upstream::workflow;
 
 /// 出图轮询上限。跟 LLM 的整体 timeout 分开，因为任务在节点上**真的在跑**。
@@ -45,7 +46,8 @@ pub async fn generate(
 ) -> ApiResult<Response> {
     let started = Instant::now();
     let request_id = uuid::Uuid::new_v4().to_string();
-    let acct = a.0;
+    let acct = a.account;
+    let key = a.key;
     let req = body.0;
     let snap = s.snapshot();
 
@@ -100,14 +102,25 @@ pub async fn generate(
     let reserved = price.saturating_mul(batch_hint);
     ledger::reserve(&s.pool, acct.id, reserved, &request_id).await?;
 
-    let result = run(s.clone(), &acct, wf, &req, &request_id, started, reserved, raw_mode).await;
+    let result = run(
+        s.clone(),
+        &acct,
+        &key,
+        wf,
+        &req,
+        &request_id,
+        started,
+        reserved,
+        raw_mode,
+    )
+    .await;
     match result {
         Ok(v) => Ok(axum::Json(v).into_response()),
         Err(e) => {
             ledger::release_all(&s.pool, acct.id, reserved, &request_id).await;
             usage::write(
                 &s.pool,
-                &error_entry(&acct, &name, &request_id, started, &e, false),
+                &error_entry(&acct, &key, &name, &request_id, started, &e, false),
             )
             .await
             .ok();
@@ -123,6 +136,7 @@ pub async fn generate(
 async fn run(
     s: Arc<AppState>,
     acct: &crate::domain::account::Account,
+    key: &crate::domain::api_key::ApiKey,
     wf: &crate::domain::workflow::Workflow,
     req: &Value,
     request_id: &str,
@@ -170,16 +184,19 @@ async fn run(
 
     // ── 账号闸门 ──
     let queue_timeout = Duration::from_secs(s.cfg.queue_timeout_secs.max(600));
-    let acct_gate = s.account_gate(acct.id).await;
-    let acct_lease = acct_gate
+    // 额度在 key 上：同一账号的各把 key 各限各的
+    let key_gate = s.key_gate(key.id).await;
+    let key_lease = key_gate
         .acquire(
-            acct.max_concurrency(ResourceKind::Image),
-            acct.max_queue(ResourceKind::Image),
+            key.max_concurrency(ResourceKind::Image),
+            key.max_queue(ResourceKind::Image),
             Priority::Batch,
             Some(queue_timeout),
         )
         .await
-        .map_err(|e| ApiError::queue_full(format!("账号出图并发已满：{e}")))?;
+        .map_err(|e| {
+            ApiError::queue_full(format!("API Key「{}」出图并发已满：{e}", key.name))
+        })?;
 
     let client = ComfyClient::new(Duration::from_secs(10), POLL_TIMEOUT)
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -207,11 +224,19 @@ async fn run(
             }
             Err(e) => {
                 let (retryable, err) = match e {
-                    // 工作流本身错了：换端点只是把同一个坏工作流再发一遍
+                    // 工作流本身错了：换端点只是把同一个坏工作流再发一遍。
+                    // 这条**不脱敏**：它说的是「你提交的这份工作流哪里不对」，
+                    // 调用方没有它就没法改，对应上游 body 里也确实没有网关的
+                    // 拓扑信息。
                     ComfyError::Workflow(m) => (false, ApiError::bad_request(m)),
                     ComfyError::Timeout => (true, ApiError::upstream("出图超时")),
-                    ComfyError::Job { message } => (false, ApiError::upstream(message)),
-                    ComfyError::Endpoint { message } => (true, ApiError::upstream(message)),
+                    // 这两条来自传输层，reqwest 会把端点 URL 拼进去
+                    ComfyError::Job { message } => {
+                        (false, ApiError::upstream(sanitize::sanitize(&message)))
+                    }
+                    ComfyError::Endpoint { message } => {
+                        (true, ApiError::upstream(sanitize::sanitize(&message)))
+                    }
                 };
                 drop(pick.lease);
                 if retryable {
@@ -228,7 +253,7 @@ async fn run(
     let Some((node_name, node_id, images, queue_wait_ms)) = rendered else {
         return Err(last.unwrap_or_else(|| ApiError::upstream("没有可用的 ComfyUI 端点")));
     };
-    let _ = acct_lease;
+    let _ = key_lease;
 
     if images.is_empty() {
         return Err(ApiError::upstream("ComfyUI 没有返回任何图片"));
@@ -245,7 +270,7 @@ async fn run(
                 message: "端点已下线".into(),
             }),
         };
-        let bytes = bytes.map_err(|e| ApiError::upstream(e.to_string()))?;
+        let bytes = bytes.map_err(|e| ApiError::upstream(sanitize::sanitize(&e.to_string())))?;
 
         out.push(json!({
             "b64_json": base64::engine::general_purpose::STANDARD.encode(&bytes),
@@ -266,12 +291,13 @@ async fn run(
         &usage::LogEntry {
             request_id: request_id.to_string(),
             account_id: acct.id,
+            api_key_id: key.id,
             kind: "image",
             protocol: None,
             target: wf.name.clone(),
             node_id: Some(node_id),
             node_name: Some(node_name),
-            key_id: None,
+            node_key_id: None,
             rotated_count: 0,
             stream: false,
             status: "ok",
@@ -279,6 +305,8 @@ async fn run(
             error_message: None,
             queue_wait_ms,
             latency_ms: started.elapsed().as_millis() as i64,
+            // 出图是一次性返回的，没有「首个 token」这回事
+            ttft_ms: None,
             usage: UnifiedUsage::default(),
             tokens_source: "none",
             image_count: images.len() as i64,
@@ -368,6 +396,7 @@ async fn record_prompt(
 
 fn error_entry(
     acct: &crate::domain::account::Account,
+    key: &crate::domain::api_key::ApiKey,
     target: &str,
     request_id: &str,
     started: Instant,
@@ -377,12 +406,13 @@ fn error_entry(
     usage::LogEntry {
         request_id: request_id.to_string(),
         account_id: acct.id,
+        api_key_id: key.id,
         kind: "image",
         protocol: None,
         target: target.to_string(),
         node_id: None,
         node_name: None,
-        key_id: None,
+        node_key_id: None,
         rotated_count: 0,
         stream: false,
         status: "error",
@@ -390,6 +420,8 @@ fn error_entry(
         error_message: Some(e.message.clone()),
         queue_wait_ms: 0,
         latency_ms: started.elapsed().as_millis() as i64,
+        // 出图没有首 token
+        ttft_ms: None,
         usage: UnifiedUsage::default(),
         tokens_source: "none",
         image_count: 0,

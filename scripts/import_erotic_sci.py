@@ -561,10 +561,11 @@ def main() -> int:
                          "尺寸由调用方的 size 决定，所以只导这一条；"
                          "源仓库里其余模板（zit-1024 / zit-cover-3x4）与它"
                          "归一化后完全相同，只是把尺寸提前固化进了副本。")
-    ap.add_argument("--comfy-node-name", default="n1-comfy")
+    ap.add_argument("--comfy-node-name", default="comfyui",
+                    help="ComfyUI 端点在网关里的节点名")
     ap.add_argument("--comfy-max-concurrency", type=int, default=2)
-    ap.add_argument("--disable-nodes", nargs="*", default=["m2"],
-                    help="导入但停用的节点名")
+    ap.add_argument("--disable-nodes", nargs="*", default=[],
+                    help="导入但停用的节点名（默认不禁用任何节点）")
     ap.add_argument("--account-name", default="home")
     ap.add_argument("--account-topup-yuan", type=float, default=10.0)
     ap.add_argument("--account-llm-concurrency", type=int, default=8)

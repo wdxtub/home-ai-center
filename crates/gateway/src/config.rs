@@ -26,6 +26,13 @@ pub struct Config {
     pub queue_timeout_secs: u64,
     /// 单个请求内最多轮换几把 key。
     pub max_key_rotation: usize,
+    /// 允许跨域访问的源（`HOME_AI_CORS_ORIGINS`，逗号分隔）。
+    ///
+    /// **默认为空 = 不加 CORS 层，即只允许同源。** 内置前端是同源的
+    /// （SPA 走 fallback），开发时 vite 也代理到本机，所以默认关掉
+    /// 不会影响正常使用；开着则等于允许任意网页带着调用方 key 跨域
+    /// 打 `/v1` 并读响应。
+    pub cors_origins: Vec<String>,
 }
 
 /// 未显式指定时区时用的默认时区（写库校验要用，不能读环境变量）。
@@ -41,6 +48,12 @@ impl Config {
         let timezone = env_or("HOME_AI_TIMEZONE", DEFAULT_TZ);
         let backup_at = env_or("HOME_AI_BACKUP_AT", "03:30");
         let admin_token = std::env::var("HOME_AI_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
+        let cors_origins: Vec<String> = std::env::var("HOME_AI_CORS_ORIGINS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
 
         Self {
             bind: env_or("HOME_AI_BIND", "0.0.0.0:8080"),
@@ -60,6 +73,7 @@ impl Config {
             max_key_rotation: env_or("HOME_AI_MAX_KEY_ROTATION", "3")
                 .parse()
                 .unwrap_or(3),
+            cors_origins,
         }
     }
 
@@ -149,6 +163,7 @@ mod tests {
             probe_interval_secs: 15,
             queue_timeout_secs: 120,
             max_key_rotation: 3,
+            cors_origins: Vec::new(),
         }
     }
 

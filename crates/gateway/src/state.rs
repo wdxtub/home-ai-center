@@ -116,14 +116,21 @@ pub struct AppState {
     pub snapshot: arc_swap::ArcSwap<Snapshot>,
     /// 每个节点一个并发闸门，key = node id 的字符串形式。
     pub node_gates: tokio::sync::RwLock<HashMap<i64, Arc<SlotGate>>>,
-    /// 账号层闸门，key = account id。
-    pub account_gates: tokio::sync::RwLock<HashMap<i64, Arc<SlotGate>>>,
+    /// 每把调用方 key 一个并发闸门，key = api_key.id。
+    ///
+    /// 曾经是**账号**一层闸门，那时 key 只是 account 的一列，
+    /// 「同账号多把 key 各自限流」在结构上做不到。额度下沉到 key 之后，
+    /// 闸门跟着换到 key 维度。
+    pub key_gates: tokio::sync::RwLock<HashMap<i64, Arc<SlotGate>>>,
     /// 每个 ComfyUI 端点一个并发闸门。**一端点一泳道**：
     /// ComfyUI 自己也有队列，网关这层再叠一次才不会把端点压垮。
     pub comfy_gates: tokio::sync::RwLock<HashMap<i64, Arc<SlotGate>>>,
     pub keys: Arc<KeyRing>,
     /// 节点健康与冷却退避表，**进程级唯一**。
     pub health: Arc<crate::gate::node_gate::NodeHealth>,
+    /// 管理面登录失败节流，**进程级唯一**。放这里是因为它必须跨请求共享：
+    /// 放请求局部的话每次都从零开始，等于没有。
+    pub login_throttle: crate::api::auth::LoginThrottle,
 }
 
 impl AppState {
@@ -147,13 +154,13 @@ impl AppState {
             .clone()
     }
 
-    pub async fn account_gate(&self, account_id: i64) -> Arc<SlotGate> {
-        if let Some(g) = self.account_gates.read().await.get(&account_id) {
+    pub async fn key_gate(&self, key_id: i64) -> Arc<SlotGate> {
+        if let Some(g) = self.key_gates.read().await.get(&key_id) {
             return g.clone();
         }
-        let mut w = self.account_gates.write().await;
-        w.entry(account_id)
-            .or_insert_with(|| Arc::new(SlotGate::new(format!("account:{account_id}"))))
+        let mut w = self.key_gates.write().await;
+        w.entry(key_id)
+            .or_insert_with(|| Arc::new(SlotGate::new(format!("apikey:{key_id}"))))
             .clone()
     }
 

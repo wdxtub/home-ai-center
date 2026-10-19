@@ -40,7 +40,7 @@ cd web && npm run dev
 
 ```bash
 cd web && npm run build          # 改了前端
-cargo test --all                 # 195 项 lib 测试（无集成测试、无 doctest）
+cargo test --all                 # 258 项 lib 测试（无集成测试、无 doctest）
 python3 scripts/audit_sql.py     # 改了 SQL 才需要
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings

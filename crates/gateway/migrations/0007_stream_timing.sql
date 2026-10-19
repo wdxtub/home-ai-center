@@ -1,0 +1,30 @@
+-- 流式首 token 等待时间，用来比较不同上游的响应速度。
+--
+-- ## 记的是什么
+--
+-- **上游**的首 token 等待时间，**已经扣掉在网关自己的排队**（`queue_wait_ms`）。
+-- 队列满时可能等几十秒，那衡量的是网关的并发额度，不是上游的性能——
+-- 混在一起的话，两个上游的对比会被排队噪声盖掉。
+--
+-- 想要含排队的原始墙钟时间，自己加回来即可：
+-- `ttft_ms + queue_wait_ms`。
+--
+-- ## 为什么是 NULL 而不是 0
+--
+-- 只有**流式**请求才有「首 token」这回事：
+-- - 非流式是一次性响应，客户端拿到响应时内容已经全在，
+--   `latency_ms` 本身就是全部信息，硬拆一个 TTFT 出来是编的；
+-- - 流还没吐出内容就断了（上游报错、客户端掐断）也没有首 token。
+--
+-- 这两种情况一律留 NULL。记 0 会被当成「快得离谱」，参与平均时
+-- 把统计拉歪——这正是本仓库反复在治的那类「编一个数出来」的病。
+--
+-- ## 配套口径
+--
+-- `completion_tokens / 生成耗时` 才是**纯生成速度**（token/秒），
+-- 生成耗时 = `latency_ms - queue_wait_ms - ttft_ms`。
+-- 直接拿 `completion_tokens / latency_ms` 会把 prefill 算进去，
+-- 长 prompt 的请求被算得明显更慢，拿它比较上游会得出相反的结论。
+-- 该换算的边界（分母 ≤ 0、无 token）见 `billing::usage::decode_tokens_per_sec`。
+
+ALTER TABLE request_log ADD COLUMN ttft_ms INTEGER;
